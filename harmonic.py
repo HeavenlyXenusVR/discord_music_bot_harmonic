@@ -76,15 +76,15 @@ aiohttp.ClientSession._request = patched__request
 WEBHOOK_URL = os.getenv('HARMONIC_WEBHOOK_URL', '').strip()
 
 async def send_webhook_log(bot_name, title, description, color, retries=3, image_url=None, fields=None):
-    if not WEBHOOK_URL or WEBHOOK_URL == 'PASTE_YOUR_NEW_WEBHOOK_URL_HERE': 
+    if not WEBHOOK_URL or WEBHOOK_URL == 'PASTE_YOUR_NEW_WEBHOOK_URL_HERE':
         return
-        
+
     for attempt in range(retries):
         try:
             async with HTTPSessionManager() as session:
                 webhook = discord.Webhook.from_url(WEBHOOK_URL, session=session)
                 embed = discord.Embed(title=title, description=description, color=color, timestamp=discord.utils.utcnow())
-                embed.set_footer(text=f"Swarm Network Matrix")
+                embed.set_footer(text="Swarm Network Matrix")
                 if image_url: embed.set_thumbnail(url=image_url)
                 if fields:
                     for name, value, inline in fields:
@@ -99,22 +99,58 @@ async def send_webhook_log(bot_name, title, description, color, retries=3, image
             if attempt < retries - 1: await asyncio.sleep(2 ** attempt)
             else: logger.error(f"❌ Webhook Dispatch Failed: {e}")
 
+async def ensure_database_exists():
+    """Create this bot's MariaDB schema before opening the normal pooled connection."""
+    db_name = str(DB_CONFIG.get("db") or "").strip()
+    if not db_name:
+        raise RuntimeError("DB_CONFIG['db'] is empty; cannot create bot database.")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", db_name):
+        raise RuntimeError(f"Unsafe database name in DB_CONFIG['db']: {db_name!r}")
+    conn = await aiomysql.connect(
+        host=DB_CONFIG.get("host", "host.docker.internal"),
+        port=int(DB_CONFIG.get("port", 3306)),
+        user=DB_CONFIG.get("user", "botuser"),
+        password=DB_CONFIG.get("password", ""),
+        autocommit=True,
+        connect_timeout=10,
+    )
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+    finally:
+        conn.close()
+
 class DBPoolManager:
     _pool = None
-    _lock = None
+    _lock = asyncio.Lock()  # Eagerly initialised – no race on first __aenter__
+
     async def __aenter__(self):
-        if DBPoolManager._lock is None:
-            DBPoolManager._lock = asyncio.Lock()
         async with DBPoolManager._lock:
-            if not DBPoolManager._pool:
-                DBPoolManager._pool = await aiomysql.create_pool(**DB_CONFIG)
+            pool = DBPoolManager._pool
+            if pool is None or getattr(pool, "closed", False):
+                await ensure_database_exists()
+                DBPoolManager._pool = await aiomysql.create_pool(minsize=1, maxsize=10, **DB_CONFIG)
+            else:
+                try:
+                    async with pool.acquire() as conn:
+                        await conn.ping(reconnect=True)
+                except Exception:
+                    try:
+                        pool.close()
+                        await pool.wait_closed()
+                    except Exception:
+                        pass
+                    await ensure_database_exists()
+                    DBPoolManager._pool = await aiomysql.create_pool(minsize=1, maxsize=10, **DB_CONFIG)
         return DBPoolManager._pool
-    async def __aexit__(self, exc_type, exc_val, exc_tb): pass
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return False
 
 class HTTPSessionManager:
     _session = None
     async def __aenter__(self):
-        if not HTTPSessionManager._session:
+        if not HTTPSessionManager._session or HTTPSessionManager._session.closed:
             HTTPSessionManager._session = aiohttp.ClientSession()
         return HTTPSessionManager._session
     async def __aexit__(self, exc_type, exc_val, exc_tb): pass
@@ -124,20 +160,288 @@ file_handler = logging.FileHandler(filename="discord_bot.log", encoding="utf-8",
 discord.utils.setup_logging(handler=file_handler, level=logging.INFO)
 logger = logging.getLogger("discord")
 
+def _player_is_playing(player):
+    """Robust Wavelink/discord.py playback detector.
+
+    Fixes false idle presence by treating a connected player with a current
+    track as active even when Wavelink's boolean flag is stale/unimplemented.
+    """
+    if not player:
+        return False
+    for attr in ("playing", "is_playing"):
+        value = getattr(player, attr, None)
+        try:
+            if callable(value):
+                value = value()
+        except TypeError:
+            pass
+        except Exception:
+            value = None
+        if isinstance(value, bool) and value:
+            return True
+    if _player_current_track(player) is not None and not _player_is_paused(player):
+        return True
+    return False
+
+def _player_is_paused(player):
+    if not player:
+        return False
+    for attr in ("paused", "is_paused"):
+        value = getattr(player, attr, None)
+        try:
+            if callable(value):
+                value = value()
+        except TypeError:
+            pass
+        except Exception:
+            value = None
+        if isinstance(value, bool):
+            return value
+    return False
+
+def _player_current_track(player):
+    if not player:
+        return None
+    for attr in ("current", "track", "source", "playing_track"):
+        try:
+            value = getattr(player, attr, None)
+            if callable(value):
+                value = value()
+            if value:
+                return value
+        except Exception:
+            continue
+    return None
+
+def _track_title_from_obj(track):
+    if not track:
+        return None
+    if isinstance(track, str):
+        return track.strip() or None
+    for attr in ("title", "name", "raw_title"):
+        try:
+            value = getattr(track, attr, None)
+            if callable(value):
+                value = value()
+            if value:
+                return str(value).strip()
+        except Exception:
+            continue
+    try:
+        value = str(track).strip()
+        if value and value.lower() not in {"none", "unknown"}:
+            return value
+    except Exception:
+        pass
+    return None
+
+def _voice_client_connected(vc):
+    if not vc:
+        return False
+    try:
+        value = getattr(vc, "is_connected", None)
+        if callable(value):
+            return bool(value())  # Return definitive result; False means disconnected
+        if isinstance(value, bool):
+            return value
+    except Exception:
+        pass
+    return bool(getattr(vc, "channel", None))
+
+def _player_is_active(player):
+    return _player_is_playing(player) or _player_is_paused(player) or (_voice_client_connected(player) and _player_current_track(player) is not None)
+# --- OPTIMIZATION MAP: startup, DB bootstrap, runtime recovery, slash commands, and swarm bridge are intentionally separated below. ---
 # --- CONFIGURATION ---
 BOT_ENV_PREFIX = "HARMONIC"
 TOKEN = os.getenv(f"{BOT_ENV_PREFIX}_DISCORD_TOKEN", "").strip()
 DB_CONFIG = {
-    'host': os.getenv(f"{BOT_ENV_PREFIX}_DB_HOST", "127.0.0.1"),
-    'user': os.getenv(f"{BOT_ENV_PREFIX}_DB_USER", "botuser"),
-    'password': os.getenv(f"{BOT_ENV_PREFIX}_DB_PASSWORD", ""),
-    'db': os.getenv(f"{BOT_ENV_PREFIX}_DB_NAME", "discord_music_harmonic"),
-    'autocommit': True
+    'host': os.getenv(f"{BOT_ENV_PREFIX}_DB_HOST") or os.getenv("DB_HOST") or os.getenv("MYSQL_HOST") or "host.docker.internal",
+    'user': os.getenv(f"{BOT_ENV_PREFIX}_DB_USER") or os.getenv("DB_USER") or os.getenv("MYSQL_USER") or "botuser",
+    'password': os.getenv(f"{BOT_ENV_PREFIX}_DB_PASSWORD") or os.getenv("DB_PASSWORD") or os.getenv("MYSQL_PASSWORD") or "",
+    'db': os.getenv(f"{BOT_ENV_PREFIX}_DB_NAME") or "discord_music_harmonic",
+    'autocommit': True,
+    'pool_recycle': 280
 }
-DEFAULT_LAVALINK_URI = os.getenv("LAVALINK_URI", "http://127.0.0.1:2333")
+DEFAULT_LAVALINK_URI = os.getenv("LAVALINK_URI") or os.getenv("LAVALINK_URL") or os.getenv("LAVALINK_HOST") or "http://127.0.0.1:2333"
 DEFAULT_LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "gws_swarm_secret_password")
 LAVALINK_URI = os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_URI", DEFAULT_LAVALINK_URI).strip()
 LAVALINK_PASSWORD = os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_PASSWORD", DEFAULT_LAVALINK_PASSWORD).strip()
+
+ERROR_WEBHOOK_URL = (
+    os.getenv(f"{BOT_ENV_PREFIX}_ERROR_WEBHOOK_URL", "").strip()
+    or os.getenv("SWARM_ERROR_WEBHOOK_URL", "").strip()
+    or os.getenv("ERROR_WEBHOOK_URL", "").strip()
+    or os.getenv("SWARM_WEBHOOK_ERROR_URL", "").strip()
+)
+error_reporting_installed = False
+
+
+def _shorten_error_text(value, limit=1800):
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+async def _persist_error_event(title, description, traceback_text=None, guild_id=None, error_type="runtime", level="error"):
+    table_name = f"{BOT_ENV_PREFIX.lower()}_error_events"
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS {table_name} (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            bot_name VARCHAR(50) NOT NULL,
+                            guild_id BIGINT NULL,
+                            error_level VARCHAR(20) NOT NULL DEFAULT 'error',
+                            error_type VARCHAR(50) NOT NULL DEFAULT 'runtime',
+                            title VARCHAR(255) NOT NULL,
+                            description TEXT NULL,
+                            traceback_text MEDIUMTEXT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+                    await cur.execute(
+                        f"INSERT INTO {table_name} (bot_name, guild_id, error_level, error_type, title, description, traceback_text) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (BOT_ENV_PREFIX.lower(), guild_id, level, error_type, _shorten_error_text(title, 255), _shorten_error_text(description, 5000), _shorten_error_text(traceback_text, 20000) if traceback_text else None),
+                    )
+    except Exception as db_exc:
+        print(f"[{BOT_ENV_PREFIX}] Failed to persist error event: {db_exc}", file=sys.stderr)
+
+
+async def send_error_webhook_log(bot_name, title, description, color=discord.Color.red(), retries=3, fields=None, traceback_text=None):
+    if not ERROR_WEBHOOK_URL or ERROR_WEBHOOK_URL == 'PASTE_YOUR_NEW_WEBHOOK_URL_HERE':
+        return
+
+    for attempt in range(retries):
+        try:
+            async with HTTPSessionManager() as session:
+                webhook = discord.Webhook.from_url(ERROR_WEBHOOK_URL, session=session)
+                embed = discord.Embed(
+                    title=_shorten_error_text(title, 256),
+                    description=_shorten_error_text(description, 3500),
+                    color=color,
+                    timestamp=discord.utils.utcnow(),
+                )
+                embed.set_footer(text="Swarm Error Matrix")
+                if fields:
+                    for name, value, inline in fields:
+                        embed.add_field(name=name, value=_shorten_error_text(value, 1024), inline=inline)
+                if traceback_text:
+                    embed.add_field(name="Traceback", value="```py\n{}\n```".format(_shorten_error_text(traceback_text, 900)), inline=False)
+                await webhook.send(embed=embed, username=f"Error Node: {bot_name.capitalize()}")
+                return
+        except discord.errors.NotFound:
+            print(f"[{BOT_ENV_PREFIX}] Error webhook no longer exists.", file=sys.stderr)
+            return
+        except Exception as exc:
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                print(f"[{BOT_ENV_PREFIX}] Error webhook dispatch failed: {exc}", file=sys.stderr)
+
+
+async def report_runtime_error(title, error=None, *, description=None, traceback_text=None, guild_id=None, error_type="runtime", level="error"):
+    if description is None:
+        description = str(error or title)
+    if traceback_text is None and error is not None:
+        traceback_text = ''.join(__import__('traceback').format_exception(type(error), error, error.__traceback__))
+    field_rows = []
+    if guild_id:
+        field_rows.append(("Guild ID", str(guild_id), True))
+    if error_type:
+        field_rows.append(("Type", str(error_type), True))
+    await _persist_error_event(title, description, traceback_text=traceback_text, guild_id=guild_id, error_type=error_type, level=level)
+    await send_error_webhook_log(
+        bot.user.name if getattr(bot, 'user', None) else BOT_ENV_PREFIX,
+        title,
+        description,
+        color=discord.Color.red(),
+        fields=field_rows,
+        traceback_text=traceback_text,
+    )
+
+
+def dispatch_runtime_error(title, error=None, *, description=None, traceback_text=None, guild_id=None, error_type="runtime", level="error"):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = getattr(bot, 'loop', None)
+    if loop and loop.is_running():
+        loop.create_task(
+            report_runtime_error(
+                title,
+                error,
+                description=description,
+                traceback_text=traceback_text,
+                guild_id=guild_id,
+                error_type=error_type,
+                level=level,
+            )
+        )
+
+
+class SwarmErrorWebhookHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        if not message:
+            return
+        lowered = message.lower()
+        if "error webhook dispatch failed" in lowered or "failed to persist error event" in lowered:
+            return
+        traceback_text = None
+        if record.exc_info:
+            traceback_text = ''.join(__import__('traceback').format_exception(*record.exc_info))
+        dispatch_runtime_error(
+            f"Python Log Error [{record.name}]",
+            description=message,
+            traceback_text=traceback_text,
+            error_type="python_log",
+            level="error",
+        )
+
+
+def _asyncio_exception_handler(loop, context):
+    error = context.get('exception')
+    message = context.get('message') or 'Unhandled asyncio exception'
+    traceback_text = None
+    if error is not None:
+        traceback_text = ''.join(__import__('traceback').format_exception(type(error), error, error.__traceback__))
+    elif context:
+        traceback_text = repr(context)
+    dispatch_runtime_error(
+        'Asyncio Runtime Error',
+        error,
+        description=message,
+        traceback_text=traceback_text,
+        error_type='asyncio',
+        level='error',
+    )
+
+
+def install_error_reporting():
+    global error_reporting_installed
+    if error_reporting_installed:
+        return
+    handler = SwarmErrorWebhookHandler(level=logging.ERROR)
+    logger.addHandler(handler)
+    logging.getLogger().addHandler(handler)
+    sys.excepthook = lambda exc_type, exc, tb: dispatch_runtime_error(
+        'Uncaught Python Exception',
+        exc,
+        description=str(exc),
+        traceback_text=''.join(__import__('traceback').format_exception(exc_type, exc, tb)),
+        error_type='uncaught_exception',
+        level='critical',
+    )
+    error_reporting_installed = True
+
 
 def _normalize_lavalink_uri(uri: str) -> str:
     value = str(uri or "").strip()
@@ -174,10 +478,36 @@ recovery_retry_tasks = {}
 recovery_retry_counts = {}
 idle_voice_since = {}
 auto_restore_snooze_until = {}
-recovery_bootstrap_started = False
+startup_task_registry = {}
+
+
+def schedule_named_task(name, coro):
+    """Prevent duplicate startup/recovery tasks across reconnecting on_ready events."""
+    existing = startup_task_registry.get(name)
+    if existing and not existing.done():
+        return existing
+    task = asyncio.create_task(coro)
+    startup_task_registry[name] = task
+
+    def _cleanup(done_task):
+        if startup_task_registry.get(name) is done_task:
+            startup_task_registry.pop(name, None)
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Background task %s failed", name)
+
+    task.add_done_callback(_cleanup)
+    return task
 
 
 vote_skip_sessions = {}
+metrics_last_errors = {}
+METRICS_HEARTBEAT_INTERVAL = max(5, int(os.getenv(f"{BOT_ENV_PREFIX}_METRICS_HEARTBEAT_INTERVAL", os.getenv("METRICS_HEARTBEAT_INTERVAL", "15"))))
+VOICE_REJOIN_DELAY_SECONDS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_DELAY_SECONDS", os.getenv("VOICE_REJOIN_DELAY_SECONDS", "5"))))
+
 lavalink_connect_task = None
 lavalink_connect_lock = asyncio.Lock()
 
@@ -214,7 +544,7 @@ async def _connect_lavalink_forever():
 def ensure_lavalink_connection_task():
     global lavalink_connect_task
     if lavalink_connect_task is None or lavalink_connect_task.done():
-        lavalink_connect_task = bot.loop.create_task(_connect_lavalink_forever())
+        lavalink_connect_task = asyncio.create_task(_connect_lavalink_forever())
     return lavalink_connect_task
 
 async def ensure_lavalink_ready(timeout: float = 20.0) -> bool:
@@ -227,6 +557,31 @@ async def ensure_lavalink_ready(timeout: float = 20.0) -> bool:
             return True
         await asyncio.sleep(0.5)
     return _has_connected_lavalink_node()
+
+@tasks.loop(seconds=30.0)
+async def lavalink_health_monitor():
+    try:
+        if not _has_connected_lavalink_node():
+            logger.warning("[harmonic] Lavalink health check failed; reconnect task armed.")
+            ensure_lavalink_connection_task()
+            for guild in bot.guilds:
+                vc = guild.voice_client
+                if vc and not getattr(vc, "playing", False) and not getattr(vc, "paused", False):
+                    state = await derive_recovery_state_from_db(guild.id)
+                    channel_id = (state or {}).get("voice_channel_id") or getattr(getattr(vc, "channel", None), "id", None)
+                    if channel_id:
+                        position = int((state or {}).get("position", 0) or 0)
+                        await remember_recovery_state(guild.id, channel_id, position)
+                        schedule_recovery_retry(guild.id, channel_id, start_position=position, reason="lavalink_health")
+    except Exception:
+        logger.exception("[harmonic] Lavalink health monitor failed.")
+
+async def on_ready_lavalink_health():
+    ensure_lavalink_connection_task()
+    if not lavalink_health_monitor.is_running():
+        lavalink_health_monitor.start()
+bot.add_listener(on_ready_lavalink_health, 'on_ready')
+
 
 def _safe_display_name(member_or_user):
     if not member_or_user:
@@ -250,14 +605,13 @@ async def resolve_requester_name(guild, requester_id):
         user = await bot.fetch_user(requester_id)
         return _safe_display_name(user)
     except Exception:
-        return "Unknown User"
+        return f"User {requester_id}"
 
 async def get_autodj_enabled(guild_id):
     try:
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_swarm_toggles (guild_id BIGINT PRIMARY KEY, auto_dj BOOLEAN DEFAULT FALSE, audio_filter VARCHAR(20) DEFAULT 'normal')")
                     await cur.execute("SELECT auto_dj FROM harmonic_swarm_toggles WHERE guild_id = %s", (guild_id,))
                     row = await cur.fetchone()
                     return bool(row and row.get('auto_dj'))
@@ -268,13 +622,13 @@ async def set_autodj_enabled(guild_id, enabled):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_swarm_toggles (guild_id BIGINT PRIMARY KEY, auto_dj BOOLEAN DEFAULT FALSE, audio_filter VARCHAR(20) DEFAULT 'normal')")
                 await cur.execute("INSERT INTO harmonic_swarm_toggles (guild_id, auto_dj) VALUES (%s, %s) ON DUPLICATE KEY UPDATE auto_dj = VALUES(auto_dj)", (guild_id, bool(enabled)))
 
 async def build_autodj_query(cur, guild_id):
     await cur.execute("SELECT title FROM harmonic_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT 8", (guild_id,))
     recent_rows = await cur.fetchall()
-    recent_titles = [row[0] for row in recent_rows if row and row[0]]
+    _t = lambda r: r.get("title") if isinstance(r, dict) else r[0]  # DictCursor-safe
+    recent_titles = [_t(row) for row in recent_rows if row and _t(row)]
     for title in recent_titles:
         cleaned = re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", title).strip()
         if cleaned:
@@ -291,8 +645,9 @@ async def maybe_enqueue_autodj(cur, guild, channel_id):
         history_titles = set()
         await cur.execute("SELECT title FROM harmonic_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT 12", (guild.id,))
         for row in await cur.fetchall():
-            if row and row[0]:
-                history_titles.add(str(row[0]).strip().lower())
+            _rv = row.get("title") if isinstance(row, dict) else row[0]  # DictCursor-safe
+            if row and _rv:
+                history_titles.add(str(_rv).strip().lower())
         chosen = None
         for entry in entries:
             title_key = str(getattr(entry, 'title', '')).strip().lower()
@@ -304,7 +659,7 @@ async def maybe_enqueue_autodj(cur, guild, channel_id):
         if not chosen:
             return False
         await enqueue_track(cur, guild.id, chosen.uri, chosen.title, bot.user.id if bot.user else None)
-        bot.loop.create_task(process_queue(guild, channel_id))
+        schedule_named_task(f"autodj_process_queue:{guild.id}", process_queue(guild, channel_id))
         return True
     except Exception as exc:
         logger.warning(f"[{guild.id}] Auto-DJ recommendation failed: {exc}")
@@ -331,8 +686,10 @@ async def init_db():
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_playback_state (guild_id BIGINT, bot_name VARCHAR(50), channel_id BIGINT, video_url TEXT, position_seconds INT DEFAULT 0, is_playing BOOLEAN DEFAULT FALSE, title TEXT, PRIMARY KEY (guild_id, bot_name))")
+                await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_playback_state (guild_id BIGINT, bot_name VARCHAR(50), channel_id BIGINT, video_url TEXT, position_seconds INT DEFAULT 0, is_playing BOOLEAN DEFAULT FALSE, is_paused BOOLEAN DEFAULT FALSE, title TEXT, PRIMARY KEY (guild_id, bot_name))")
                 try: await cur.execute("ALTER TABLE harmonic_playback_state ADD COLUMN title TEXT")
+                except: pass
+                try: await cur.execute("ALTER TABLE harmonic_playback_state ADD COLUMN is_paused BOOLEAN DEFAULT FALSE")
                 except: pass
                 await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_guild_settings (guild_id BIGINT PRIMARY KEY, home_vc_id BIGINT, volume INT DEFAULT 100, loop_mode VARCHAR(10) DEFAULT 'queue', filter_mode VARCHAR(20) DEFAULT 'none', dj_role_id BIGINT DEFAULT NULL, feedback_channel_id BIGINT DEFAULT NULL, transition_mode VARCHAR(10) DEFAULT 'off', custom_speed FLOAT DEFAULT 1.0, custom_pitch FLOAT DEFAULT 1.0, custom_modifiers_left INT DEFAULT 0, dj_only_mode BOOLEAN DEFAULT FALSE, stay_in_vc BOOLEAN DEFAULT FALSE)")
                 try: await cur.execute("ALTER TABLE harmonic_guild_settings MODIFY loop_mode VARCHAR(10) DEFAULT 'queue'")
@@ -354,12 +711,24 @@ async def init_db():
                 await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_history (id INT AUTO_INCREMENT PRIMARY KEY, guild_id BIGINT, video_url TEXT, title TEXT, played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, requester_id BIGINT DEFAULT NULL)")
                 await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_user_playlists (id INT AUTO_INCREMENT PRIMARY KEY, user_id BIGINT, playlist_name VARCHAR(255), video_url TEXT, title TEXT)")
                 await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_bot_home_channels (guild_id BIGINT, bot_name VARCHAR(50), home_vc_id BIGINT, PRIMARY KEY (guild_id, bot_name))")
+                await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_voice_state (guild_id BIGINT, bot_name VARCHAR(50), last_channel_id BIGINT NULL, connected_channel_id BIGINT NULL, text_channel_id BIGINT NULL, disconnected_at TIMESTAMP NULL, last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, desired_connected BOOLEAN DEFAULT FALSE, reconnect_attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL, PRIMARY KEY (guild_id, bot_name))")
+                await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_metrics (guild_id BIGINT, bot_name VARCHAR(50), voice_connected BOOLEAN DEFAULT FALSE, connected_channel_id BIGINT NULL, player_connected BOOLEAN DEFAULT FALSE, player_playing BOOLEAN DEFAULT FALSE, player_paused BOOLEAN DEFAULT FALSE, queue_count INT DEFAULT 0, backup_queue_count INT DEFAULT 0, is_playing_db BOOLEAN DEFAULT FALSE, is_paused_db BOOLEAN DEFAULT FALSE, position_seconds INT DEFAULT 0, recovery_pending BOOLEAN DEFAULT FALSE, heartbeat_age_seconds INT DEFAULT 0, lavalink_ready BOOLEAN DEFAULT FALSE, last_error TEXT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (guild_id, bot_name))")
+                try: await cur.execute("ALTER TABLE harmonic_voice_state ADD COLUMN reconnect_attempts INT NOT NULL DEFAULT 0")
+                except: pass
+                try: await cur.execute("ALTER TABLE harmonic_voice_state ADD COLUMN last_error TEXT NULL")
+                except: pass
+                try: await cur.execute("CREATE INDEX harmonic_voice_state_rejoin_idx ON harmonic_voice_state (bot_name, desired_connected, last_seen_at)")
+                except: pass
+                try: await cur.execute("CREATE INDEX harmonic_metrics_status_idx ON harmonic_metrics (bot_name, updated_at)")
+                except: pass
                 await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_active_playlists (guild_id BIGINT, bot_name VARCHAR(50), playlist_url TEXT, known_track_count INT DEFAULT 0, requester_id BIGINT, channel_id BIGINT DEFAULT NULL, PRIMARY KEY (guild_id, bot_name))")
                 try: await cur.execute("ALTER TABLE harmonic_active_playlists ADD COLUMN channel_id BIGINT DEFAULT NULL")
                 except: pass
+                await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_swarm_toggles (guild_id BIGINT PRIMARY KEY, auto_dj BOOLEAN DEFAULT FALSE, audio_filter VARCHAR(20) DEFAULT 'normal')")
                 await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_swarm_overrides (guild_id BIGINT, bot_name VARCHAR(50), command VARCHAR(20), PRIMARY KEY(guild_id, bot_name))")
                 await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_swarm_direct_orders (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50), guild_id BIGINT, vc_id BIGINT, text_channel_id BIGINT, command VARCHAR(50), data TEXT)")
                 await cur.execute("CREATE TABLE IF NOT EXISTS swarm_health (bot_name VARCHAR(50) PRIMARY KEY, last_pulse TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, status VARCHAR(20))")
+                await cur.execute(f"CREATE TABLE IF NOT EXISTS {BOT_ENV_PREFIX.lower()}_error_events (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50) NOT NULL, guild_id BIGINT NULL, error_level VARCHAR(20) NOT NULL DEFAULT 'error', error_type VARCHAR(50) NOT NULL DEFAULT 'runtime', title VARCHAR(255) NOT NULL, description TEXT NULL, traceback_text MEDIUMTEXT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
                 try: await cur.execute("CREATE INDEX harmonic_queue_lookup_idx ON harmonic_queue (guild_id, bot_name, id)")
                 except: pass
                 try: await cur.execute("CREATE INDEX harmonic_queue_backup_lookup_idx ON harmonic_queue_backup (guild_id, bot_name, id)")
@@ -383,6 +752,18 @@ async def init_db():
                 playlist_db_initialized = True
                 logger.info("Database tables verified/created for HARMONIC.")
 
+async def init_db_with_retries(attempts=12, delay=5):
+    for attempt in range(1, attempts + 1):
+        try:
+            await init_db()
+            return
+        except Exception as exc:
+            logger.exception("Database initialization failed on attempt %s/%s: %s", attempt, attempts, exc)
+            if attempt >= attempts:
+                raise
+            await asyncio.sleep(delay)
+
+# --- RUNTIME HOT PATH: keep helpers small; queue, recovery, and panel sync call these frequently. ---
 # --- CORE LOGIC & HELPERS ---
 async def save_state(guild_id):
     state = guild_states.get(guild_id)
@@ -438,6 +819,11 @@ def current_track_position(guild_id, now=None):
     data = playback_tracking.get(guild_id)
     if not data:
         return int(guild_states.get(guild_id, {}).get("position", 0))
+    # Critical: do not let the saved position keep advancing while paused.
+    # Pause/resume sync uses this helper, so drift here causes the panel, Aria,
+    # and recovery logic to resume too far into the song.
+    if data.get('paused'):
+        return max(0, int(data.get('offset', 0)))
     now = now or time.time()
     return max(0, int((now - data.get('start_time', now)) * data.get('speed', 1.0) + data.get('offset', 0)))
 
@@ -464,12 +850,221 @@ async def remember_recovery_state(guild_id, channel_id, position=0):
     invalidate_position_persist(guild_id)
     await save_state(guild_id)
 
+
+
+async def persist_voice_state(guild_id, channel_id=None, *, text_channel_id=None, desired_connected=True, connected=True, last_error=None):
+    """Persist desired/actual voice channel so restarts and Discord voice drops can recover safely."""
+    if not guild_id:
+        return
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO harmonic_voice_state
+                            (guild_id, bot_name, last_channel_id, connected_channel_id, text_channel_id, disconnected_at, desired_connected, reconnect_attempts, last_error)
+                        VALUES (%s, 'harmonic', %s, %s, %s, %s, %s, 0, %s)
+                        ON DUPLICATE KEY UPDATE
+                            last_channel_id = COALESCE(VALUES(last_channel_id), last_channel_id),
+                            connected_channel_id = VALUES(connected_channel_id),
+                            text_channel_id = COALESCE(VALUES(text_channel_id), text_channel_id),
+                            disconnected_at = VALUES(disconnected_at),
+                            desired_connected = VALUES(desired_connected),
+                            reconnect_attempts = IF(VALUES(connected_channel_id) IS NULL, reconnect_attempts, 0),
+                            last_error = VALUES(last_error),
+                            last_seen_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            guild_id,
+                            channel_id,
+                            channel_id if connected else None,
+                            text_channel_id,
+                            None if connected else datetime.datetime.utcnow(),
+                            bool(desired_connected),
+                            str(last_error)[:2000] if last_error else None,
+                        ),
+                    )
+    except Exception:
+        logger.exception("[harmonic] Failed to persist voice state for guild %s", guild_id)
+
+
+async def mark_voice_disconnected(guild_id, channel_id=None, *, desired_connected=True, reason="voice_disconnect"):
+    await persist_voice_state(guild_id, channel_id, desired_connected=desired_connected, connected=False, last_error=reason)
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE harmonic_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'",
+                        (guild_id,),
+                    )
+    except Exception:
+        logger.exception("[harmonic] Failed to mark playback disconnected for guild %s", guild_id)
+
+
+async def reconcile_runtime_playback_state(guild):
+    """Force DB playback truth to follow the real Discord/Lavalink player."""
+    if not guild:
+        return
+    vc = guild.voice_client
+    actual_connected = bool(vc and getattr(vc, "is_connected", lambda: False)())
+    actual_channel_id = getattr(getattr(vc, "channel", None), "id", None)
+    actual_playing = bool(vc and _player_is_playing(vc))
+    actual_paused = bool(vc and _player_is_paused(vc))
+    live_position = current_track_position(guild.id) if (actual_playing or actual_paused or guild.id in playback_tracking) else 0
+    if actual_connected and actual_channel_id:
+        await persist_voice_state(guild.id, actual_channel_id, desired_connected=True, connected=True)
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    if not actual_connected:
+                        await cur.execute(
+                            "UPDATE harmonic_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'",
+                            (guild.id,),
+                        )
+                    else:
+                        await cur.execute(
+                            "UPDATE harmonic_playback_state SET channel_id = COALESCE(%s, channel_id), is_playing = %s, is_paused = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'harmonic'",
+                            (actual_channel_id, actual_playing, actual_paused, live_position, guild.id),
+                        )
+    except Exception:
+        logger.exception("[harmonic] Failed to reconcile playback state for guild %s", guild.id)
+
+
+async def collect_and_persist_metrics(guild=None):
+    guilds = [guild] if guild else list(bot.guilds)
+    try:
+        lavalink_ready = await ensure_lavalink_ready(timeout=1.0)
+    except Exception:
+        lavalink_ready = False
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    for g in guilds:
+                        if not g:
+                            continue
+                        vc = g.voice_client
+                        channel_id = getattr(getattr(vc, "channel", None), "id", None)
+                        voice_connected = bool(vc and getattr(vc, "is_connected", lambda: False)())
+                        player_playing = bool(vc and _player_is_playing(vc))
+                        player_paused = bool(vc and _player_is_paused(vc))
+                        live_position = current_track_position(g.id) if (player_playing or player_paused or g.id in playback_tracking) else 0
+                        await cur.execute("SELECT COUNT(*) AS total FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic'", (g.id,))
+                        queue_row = await cur.fetchone() or {}
+                        await cur.execute("SELECT COUNT(*) AS total FROM harmonic_queue_backup WHERE guild_id = %s AND bot_name = 'harmonic'", (g.id,))
+                        backup_row = await cur.fetchone() or {}
+                        await cur.execute("SELECT is_playing, is_paused, position_seconds FROM harmonic_playback_state WHERE guild_id = %s AND bot_name = 'harmonic' LIMIT 1", (g.id,))
+                        playback_row = await cur.fetchone() or {}
+                        if not voice_connected and (playback_row.get("is_playing") or playback_row.get("is_paused")):
+                            await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'", (g.id,))
+                        elif voice_connected and (player_playing or player_paused or g.id in playback_tracking):
+                            await cur.execute(
+                                "UPDATE harmonic_playback_state SET channel_id = COALESCE(%s, channel_id), is_playing = %s, is_paused = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'harmonic'",
+                                (channel_id, player_playing, player_paused, int(live_position or playback_row.get("position_seconds") or 0), g.id),
+                            )
+                        await cur.execute(
+                            """
+                            REPLACE INTO harmonic_metrics
+                                (guild_id, bot_name, voice_connected, connected_channel_id, player_connected, player_playing, player_paused,
+                                 queue_count, backup_queue_count, is_playing_db, is_paused_db, position_seconds, recovery_pending,
+                                 heartbeat_age_seconds, lavalink_ready, last_error)
+                            VALUES (%s, 'harmonic', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s)
+                            """,
+                            (
+                                g.id,
+                                voice_connected,
+                                channel_id,
+                                voice_connected,
+                                player_playing,
+                                player_paused,
+                                int(queue_row.get("total") or 0),
+                                int(backup_row.get("total") or 0),
+                                bool(playback_row.get("is_playing")) if voice_connected else False,
+                                bool(playback_row.get("is_paused")) if voice_connected else False,
+                                int(live_position or playback_row.get("position_seconds") or 0),
+                                g.id in recovering_guilds or str(g.id) in guild_states,
+                                bool(lavalink_ready),
+                                metrics_last_errors.get(g.id),
+                            ),
+                        )
+    except Exception as exc:
+        logger.exception("[harmonic] Metrics collection failed: %s", exc)
+
+
+async def restore_persistent_voice_states():
+    """Rejoin desired voice channels after bot restart / Discord voice reconnect edges."""
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        "SELECT guild_id, COALESCE(connected_channel_id, last_channel_id) AS channel_id, reconnect_attempts FROM harmonic_voice_state WHERE bot_name = 'harmonic' AND desired_connected = TRUE AND COALESCE(connected_channel_id, last_channel_id) IS NOT NULL"
+                    )
+                    rows = list(await cur.fetchall() or [])
+        for row in rows:
+            try:
+                guild_id = int(row["guild_id"])
+                raw_channel_id = row.get("channel_id") if isinstance(row, dict) else row[1]
+                channel_id = int(raw_channel_id) if raw_channel_id else 0
+                attempts = int((row.get("reconnect_attempts") if isinstance(row, dict) else 0) or 0)
+                if attempts >= int(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_MAX_ATTEMPTS", "8")):
+                    continue
+                guild = bot.get_guild(guild_id)
+                if not guild or not channel_id:
+                    continue
+                channel = guild.get_channel(channel_id)
+                if channel is None:
+                    await persist_voice_state(guild_id, channel_id, desired_connected=False, connected=False, last_error="voice_channel_missing")
+                    continue
+                if guild.voice_client and getattr(guild.voice_client, "is_connected", lambda: False)():
+                    await persist_voice_state(guild.id, getattr(guild.voice_client.channel, "id", channel_id), desired_connected=True, connected=True)
+                    continue
+                await asyncio.sleep(VOICE_REJOIN_DELAY_SECONDS)
+                vc = await ensure_voice_connection(guild, channel_id)
+                if vc:
+                    await persist_voice_state(guild.id, channel_id, desired_connected=True, connected=True)
+                    state = await derive_recovery_state_from_db(guild.id)
+                    if state:
+                        schedule_recovery_retry(guild.id, channel_id, start_position=state.get("position", 0), reason="persistent_voice_restore")
+                else:
+                    async with DBPoolManager() as pool:
+                        async with pool.acquire() as conn:
+                            async with conn.cursor() as cur:
+                                await cur.execute("UPDATE harmonic_voice_state SET reconnect_attempts = reconnect_attempts + 1, last_error = %s WHERE guild_id = %s AND bot_name = 'harmonic'", ("rejoin_failed", guild.id))
+            except Exception as row_exc:
+                logger.warning("[harmonic] Persistent voice row recovery failed: %s", row_exc)
+    except Exception as exc:
+        logger.exception("[harmonic] Persistent voice restore failed: %s", exc)
+
+
+async def sync_pause_state(guild_id, paused: bool):
+    """Keep Discord/player pause state mirrored in DB for panel + Aria."""
+    try:
+        position = current_track_position(guild_id)
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE harmonic_playback_state SET is_paused = %s, is_playing = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'harmonic'",
+                        (bool(paused), not bool(paused), position, guild_id),
+                    )
+        if guild_id in playback_tracking:
+            playback_tracking[guild_id]["offset"] = position
+            playback_tracking[guild_id]["start_time"] = time.time()
+            playback_tracking[guild_id]["paused"] = bool(paused)
+        invalidate_position_persist(guild_id)
+    except Exception:
+        logger.exception("[harmonic] Failed to sync pause state for guild %s.", guild_id)
+
 async def insert_queue_front(cur, table_name, guild_id, bot_name, video_url, title, requester_id, max_attempts=5):
     if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
         raise ValueError(f"Unsafe table name: {table_name}")
 
     for attempt in range(max_attempts):
-        await cur.execute(f"SELECT COALESCE(MIN(id), 0) AS min_id FROM {table_name}")
+        await cur.execute(f"SELECT COALESCE(MIN(id), 0) AS min_id FROM {table_name} WHERE guild_id = %s AND bot_name = %s", (guild_id, bot_name))
         min_row = await cur.fetchone()
         new_id = (_scalar_from_row(min_row, 0) or 0) - 1
         try:
@@ -535,50 +1130,37 @@ async def restore_queue_from_backup(cur, guild_id, requester_id=None):
 
 async def restore_active_playback_entry(cur, guild_id, requester_id=None):
     await cur.execute(
-        "SELECT channel_id, video_url, title, position_seconds FROM harmonic_playback_state WHERE guild_id = %s AND bot_name = %s AND is_playing = TRUE LIMIT 1",
-        (guild_id, 'harmonic')
+        "SELECT video_url, title FROM harmonic_playback_state "
+        "WHERE guild_id = %s AND bot_name = 'harmonic' "
+        "AND video_url IS NOT NULL AND video_url <> '' "
+        "AND (is_playing = TRUE OR position_seconds > 0 OR title IS NOT NULL) "
+        "ORDER BY is_playing DESC, position_seconds DESC LIMIT 1",
+        (guild_id,),
     )
     row = await cur.fetchone()
     if not row:
-        return None
+        return 0
 
-    if isinstance(row, dict):
-        channel_id = row.get('channel_id')
-        video_url = row.get('video_url')
-        title = row.get('title') or 'Resumed Track'
-        position_seconds = int(row.get('position_seconds') or 0)
-    else:
-        channel_id, video_url, title, position_seconds = row
-        title = title or 'Resumed Track'
-        position_seconds = int(position_seconds or 0)
-
-    if not video_url:
-        return None
-
+    video_url, title = row
     await cur.execute(
-        "SELECT id, video_url FROM harmonic_queue WHERE guild_id = %s AND bot_name = %s ORDER BY id ASC LIMIT 1",
-        (guild_id, 'harmonic')
+        "SELECT video_url FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY id ASC LIMIT 1",
+        (guild_id,),
     )
     existing = await cur.fetchone()
-    existing_url = existing.get('video_url') if isinstance(existing, dict) else (existing[1] if existing else None)
+    existing_url = existing[0] if existing else None
+    if existing_url and str(existing_url).strip() == str(video_url).strip():
+        return 0
 
-    if existing_url != video_url:
-        await insert_queue_front(
-            cur,
-            "harmonic_queue",
-            guild_id,
-            "harmonic",
-            video_url,
-            title,
-            requester_id if requester_id is not None else (bot.user.id if bot.user else None),
-        )
-
-    return {
-        "channel_id": channel_id,
-        "video_url": video_url,
-        "title": title,
-        "position_seconds": position_seconds,
-    }
+    await insert_queue_front(
+        cur,
+        "harmonic_queue",
+        guild_id,
+        "harmonic",
+        video_url,
+        title or "Resumed Track",
+        requester_id if requester_id is not None else (bot.user.id if bot.user else None),
+    )
+    return 1
 
 def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="recovery"):
     if not channel_id:
@@ -596,11 +1178,11 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
 
     recovery_retry_counts[guild_id] = attempts
     delay = min(RECOVERY_RETRY_BASE_DELAY * attempts, RECOVERY_RETRY_MAX_DELAY)
+    current_task = None
 
     async def _retry():
         try:
             await asyncio.sleep(delay)
-            ensure_lavalink_connection_task()
             guild = bot.get_guild(guild_id)
             if not guild:
                 recovery_retry_counts.pop(guild_id, None)
@@ -621,11 +1203,15 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
             if running is current_task:
                 recovery_retry_tasks.pop(guild_id, None)
 
-    current_task = bot.loop.create_task(_retry())
+    current_task = asyncio.create_task(_retry())
     recovery_retry_tasks[guild_id] = current_task
 
 async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_id, *, position=0, reason="recovery"):
     await insert_queue_front(cur, "harmonic_queue", guild_id, "harmonic", url, title, requester_id)
+    await cur.execute(
+        "UPDATE harmonic_playback_state SET is_playing = FALSE, is_paused = FALSE, position_seconds = %s WHERE guild_id = %s AND bot_name = 'harmonic'",
+        (position, guild_id),
+    )
     await remember_recovery_state(guild_id, channel_id, position)
     schedule_recovery_retry(guild_id, channel_id, start_position=position, reason=reason)
 
@@ -653,24 +1239,86 @@ async def _fade_volume(voice_client, start_volume, end_volume, duration=5.0, ste
             await asyncio.sleep(step_delay)
 
 async def update_stage_topic(guild, title, requester_id):
+    """Update Stage topic AND Voice/Stage channel status for the current song.
+
+    Stage channels use StageInstance.topic. Newer Discord voice channel
+    statuses use channel.edit(status=...). Older discord.py builds may not
+    expose that keyword, so this helper is best-effort and must never stop
+    playback.
+    """
     try:
         vc = guild.voice_client
-        if not vc or not getattr(vc, "channel", None): return
+        if not vc or not getattr(vc, "channel", None):
+            return
         channel = vc.channel
-        
-        # FIX: Explicit instance check for Stage channels
-        if not isinstance(channel, discord.StageChannel): return
-
         requester_name = await resolve_requester_name(guild, requester_id)
-        topic = f"🎵 {title[:60]} | 👤 Req: {requester_name}"
+        stage_topic = f"🎵 {title[:60]} | 👤 Req: {requester_name}"
+        voice_status = f"🎵 {title[:80]}"
 
-        # FIX: Must use StageInstance to control topics
-        if channel.instance is None:
-            await channel.create_instance(topic=topic)
-        else:
-            await channel.instance.edit(topic=topic)
+        if isinstance(channel, discord.StageChannel):
+            try:
+                if channel.instance is None:
+                    await channel.create_instance(topic=stage_topic)
+                else:
+                    await channel.instance.edit(topic=stage_topic)
+            except Exception as e:
+                logger.warning(f"[{guild.id}] Stage topic update failed: {e}")
+
+        try:
+            await channel.edit(status=voice_status)
+        except TypeError:
+            pass
+        except discord.Forbidden:
+            logger.warning(f"[{guild.id}] Missing Manage Channels permission to update voice channel status.")
+        except Exception as e:
+            logger.warning(f"[{guild.id}] Voice channel status update failed: {e}")
     except Exception as e:
-        logger.error(f"[STAGE ERROR] {e}")
+        logger.error(f"[STAGE/VOICE STATUS ERROR] {e}")
+
+async def clear_voice_channel_status(guild):
+    try:
+        vc = guild.voice_client
+        channel = getattr(vc, "channel", None) if vc else None
+        if not channel:
+            return
+        try:
+            await channel.edit(status=None)
+        except TypeError:
+            pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+async def send_or_update_status_message(guild, embed):
+    """Maintain one live now-playing/status message per guild."""
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_status_messages (guild_id BIGINT, bot_name VARCHAR(50), feedback_channel_id BIGINT, message_id BIGINT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (guild_id, bot_name))")
+                await cur.execute("SELECT feedback_channel_id FROM harmonic_guild_settings WHERE guild_id = %s", (guild.id,))
+                res = await cur.fetchone()
+                if not res or not res[0]:
+                    return
+                channel = guild.get_channel(int(res[0]))
+                if not channel:
+                    return
+                await cur.execute("SELECT message_id FROM harmonic_status_messages WHERE guild_id = %s AND bot_name = 'harmonic' LIMIT 1", (guild.id,))
+                msg_row = await cur.fetchone()
+                message_id = int(msg_row[0]) if msg_row and msg_row[0] else None
+                message = None
+                if message_id:
+                    try:
+                        message = await channel.fetch_message(message_id)
+                    except Exception:
+                        message = None
+                if message:
+                    await message.edit(embed=embed)
+                    new_message_id = message.id
+                else:
+                    message = await channel.send(embed=embed)
+                    new_message_id = message.id
+                await cur.execute("REPLACE INTO harmonic_status_messages (guild_id, bot_name, feedback_channel_id, message_id) VALUES (%s, 'harmonic', %s, %s)", (guild.id, channel.id, new_message_id))
 
 async def send_feedback(guild, embed):
     async with DBPoolManager() as pool:
@@ -700,25 +1348,26 @@ async def ensure_voice_connection(guild, channel_id):
     channel = guild.get_channel(channel_id)
     if not channel: return None
     if not await ensure_lavalink_ready():
-        logger.warning(f"[{guild.id}] Lavalink not ready yet; deferring voice connection to channel {channel_id}.")
-        ensure_lavalink_connection_task()
+        logger.warning(f"[{guild.id}] Lavalink not ready yet; deferring voice connection.")
         return None
     voice_client = guild.voice_client
     pending_voice_channels[guild.id] = channel_id
     try:
-        if not voice_client: 
+        if not voice_client:
             voice_client = await channel.connect(cls=wavelink.Player, timeout=60.0)
-        elif voice_client.channel.id != channel_id: 
+        elif voice_client.channel.id != channel_id:
             await voice_client.move_to(channel)
         await ensure_self_deaf(guild, voice_client)
         if getattr(voice_client, "channel", None):
             pending_voice_channels[guild.id] = voice_client.channel.id
-        
+
         if isinstance(channel, discord.StageChannel):
             if guild.me.voice and guild.me.voice.suppress:
                 try: await guild.me.edit(suppress=False)
                 except Exception: pass
-                
+
+        await persist_voice_state(guild.id, channel_id, desired_connected=True, connected=True)
+
         return voice_client
     except Exception as e:
         logger.error(f"[{guild.id}] Voice connect error: {e}")
@@ -731,7 +1380,7 @@ async def is_dj(interaction: discord.Interaction, silent=False):
             async with conn.cursor() as cur:
                 await cur.execute("SELECT dj_role_id, dj_only_mode FROM harmonic_guild_settings WHERE guild_id = %s", (interaction.guild.id,))
                 res = await cur.fetchone()
-                if res and res[1]: 
+                if res and res[1]:
                     if res[0] and discord.utils.get(interaction.user.roles, id=res[0]): return True
                     if not silent:
                         await interaction.response.send_message(embed=discord.Embed(description="❌ **Strict DJ Mode is Active.** You need the DJ Role.", color=discord.Color.red()), ephemeral=True)
@@ -782,7 +1431,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
         )
         if _te_channel_id:
             coro = process_queue(payload.player.guild, _te_channel_id)
-            bot.loop.create_task(coro)
+            schedule_named_task(f"track_end_process_queue:{payload.player.guild.id}", coro)
 
 async def _process_queue_inner(guild, channel_id, start_position=0):
     recovering_guilds.discard(guild.id)
@@ -792,12 +1441,20 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                 await cur.execute("SELECT volume, loop_mode, filter_mode, transition_mode, custom_speed, custom_pitch, custom_modifiers_left, stay_in_vc FROM harmonic_guild_settings WHERE guild_id = %s", (guild.id,))
                 res = await cur.fetchone()
                 vol, loop_mode, filter_mode, trans_mode, c_speed, c_pitch, c_mod_left, stay_in_vc = res if res else (100, 'queue', 'none', 'off', 1.0, 1.0, 0, False)
-                
+
                 await cur.execute("SELECT id, video_url, title, requester_id FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY id ASC LIMIT 1", (guild.id,))
                 next_song = await cur.fetchone()
 
                 if not next_song:
-                    await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
+                    restored_active = await restore_active_playback_entry(cur, guild.id)
+                    restored_backup = 0 if restored_active else await restore_queue_from_backup(cur, guild.id)
+                    if restored_active or restored_backup:
+                        logger.info(f"[{guild.id}] Rebuilt live queue from persisted playback/backup state (active={restored_active}, backup={restored_backup}).")
+                        await cur.execute("SELECT id, video_url, title, requester_id FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY id ASC LIMIT 1", (guild.id,))
+                        next_song = await cur.fetchone()
+
+                if not next_song:
+                    await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
                     playback_tracking.pop(guild.id, None)
                     invalidate_position_persist(guild.id)
                     clear_recovery_retry(guild.id)
@@ -820,7 +1477,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                     return
 
                 song_id, url, title, requester_id = next_song
-                await cur.execute("DELETE FROM harmonic_queue WHERE id = %s", (song_id,))
+                await cur.execute("DELETE FROM harmonic_queue WHERE id = %s AND guild_id = %s AND bot_name = 'harmonic'", (song_id, guild.id))
 
                 try:
                     entries, _playlist_result = await search_playables(url)
@@ -842,7 +1499,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                 wav_filters = wavelink.Filters()
                 try:
                     await voice_client.set_volume(vol)
-                    
+
                     if c_mod_left > 0:
                         wav_filters.timescale.set(speed=c_speed, pitch=c_pitch)
                         c_mod_left -= 1
@@ -859,7 +1516,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                         wav_filters.equalizer.set(bands=[(0, 0.3), (1, 0.2), (2, 0.1)])
 
                     await voice_client.set_filters(wav_filters)
-                    
+
                     if trans_mode == 'fade' and start_position <= 0:
                         await voice_client.set_volume(0)
                 except Exception as e:
@@ -872,21 +1529,21 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                     if start_position > 0:
                         await voice_client.seek(int(start_position * 1000))
                     elif trans_mode == 'fade':
-                        bot.loop.create_task(_fade_volume(voice_client, 0, vol))
+                        schedule_named_task(f"fade_volume:{guild.id}", _fade_volume(voice_client, 0, vol))
                 except Exception as e:
                     logger.error(f"[{guild.id}] Playback start failed for '{title}': {e}")
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="playback_start")
                     return
 
                 # FIX: Execute auto-stage updater
-                bot.loop.create_task(update_stage_topic(guild, title, requester_id))
+                schedule_named_task(f"stage_topic:{guild.id}", update_stage_topic(guild, title, requester_id))
 
                 await cur.execute("INSERT INTO harmonic_history (guild_id, video_url, title, requester_id) VALUES (%s, %s, %s, %s)", (guild.id, url, title, requester_id))
-                await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=title))
-                playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol}
-                
+                await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\\n", " ").strip()[:120]))
+                playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False}
+
                 bot_n = os.path.basename(__file__).replace('.py', '')
-                await cur.execute(f"REPLACE INTO {bot_n}_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, title) VALUES (%s, '{bot_n}', %s, %s, %s, TRUE, %s)", (guild.id, channel_id, url, start_position, title))
+                await cur.execute(f"REPLACE INTO {bot_n}_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, is_paused, title) VALUES (%s, '{bot_n}', %s, %s, %s, TRUE, FALSE, %s)", (guild.id, channel_id, url, start_position, title))
                 # Update persistent state
                 guild_states[guild.id] = {"voice_channel_id": channel_id, "position": start_position}
                 invalidate_position_persist(guild.id)
@@ -899,12 +1556,15 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                 if requester_id:
                     requester_name = await resolve_requester_name(guild, requester_id)
                     embed.add_field(name="Requested by", value=requester_name, inline=True)
-                await send_feedback(guild, embed)
+                await send_or_update_status_message(guild, embed)
 
 async def process_queue(guild, channel_id, start_position=0):
     lock = get_process_queue_lock(guild.id)
     async with lock:
-        if guild.voice_client and (getattr(guild.voice_client, 'playing', False) or getattr(guild.voice_client, 'paused', False)):
+        vc = guild.voice_client
+        if vc and _player_is_playing(vc):
+            return
+        if vc and _player_is_paused(vc) and start_position <= 0:
             return
         return await _process_queue_inner(guild, channel_id, start_position=start_position)
 
@@ -919,89 +1579,172 @@ async def stop_playback(guild):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
+                await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
                 await cur.execute("DELETE FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
+                await cur.execute("DELETE FROM harmonic_queue_backup WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
+                await cur.execute("UPDATE harmonic_voice_state SET desired_connected = FALSE, connected_channel_id = NULL, disconnected_at = CURRENT_TIMESTAMP WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
+    await clear_voice_channel_status(guild)
     if guild.voice_client: await guild.voice_client.disconnect()
-    await bot.change_presence(status=discord.Status.online)
+    await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="the Swarm | Idle"))
 
 async def restore_guild_state(guild_id, state):
     target_guild_id = int(guild_id)
-    if target_guild_id in recovering_guilds or target_guild_id in playback_tracking:
-        return
+    guild = bot.get_guild(target_guild_id)
+    vc = guild.voice_client if guild else None
+
+    if target_guild_id in recovering_guilds:
+        if vc and _player_is_playing(vc):
+            return
+        recovering_guilds.discard(target_guild_id)
+
+    if target_guild_id in playback_tracking:
+        if vc and _player_is_active(vc):
+            return
+        logger.warning(f"[{target_guild_id}] Clearing stale playback_tracking so recovery can continue.")
+        playback_tracking.pop(target_guild_id, None)
+
     recovering_guilds.add(target_guild_id)
     handoff = False
     try:
-        guild = bot.get_guild(target_guild_id)
         if not guild:
             return
-
-        state = dict(state or {})
-        async with DBPoolManager() as pool:
-            async with pool.acquire() as conn:
-                async with conn.cursor(aiomysql.DictCursor) as cur:
-                    active_playback = await restore_active_playback_entry(cur, target_guild_id)
-
-        if active_playback:
-            state.setdefault("voice_channel_id", active_playback.get("channel_id"))
-            state["position"] = max(int(state.get("position", 0) or 0), int(active_playback.get("position_seconds", 0) or 0))
-
         vc_id = state.get("voice_channel_id")
         if not vc_id:
             return
-
         channel = guild.get_channel(vc_id)
         if not channel:
             return
 
-        await remember_recovery_state(target_guild_id, vc_id, state.get("position", 0))
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    restored_active = await restore_active_playback_entry(cur, target_guild_id)
+                    if not restored_active:
+                        await restore_queue_from_backup(cur, target_guild_id)
+                    await cur.execute(
+                        "SELECT position_seconds FROM harmonic_playback_state WHERE guild_id = %s AND bot_name = 'harmonic' AND is_playing = TRUE LIMIT 1",
+                        (target_guild_id,),
+                    )
+                    pos_row = await cur.fetchone()
+                    db_position = pos_row[0] if pos_row and pos_row[0] is not None else None
+
+        resume_position = max(0, int(db_position if db_position is not None else state.get("position", 0)))
+        await remember_recovery_state(target_guild_id, vc_id, resume_position)
 
         vc = await ensure_voice_connection(guild, vc_id)
         if not vc:
-            schedule_recovery_retry(target_guild_id, vc_id, start_position=state.get("position", 0), reason="restore_voice")
+            schedule_recovery_retry(target_guild_id, vc_id, start_position=resume_position, reason="restore_voice")
             return
 
-        bot.loop.create_task(process_queue(guild, vc_id, start_position=state.get("position", 0)))
+        schedule_named_task(f"process_queue:{target_guild_id}", process_queue(guild, vc_id, start_position=resume_position))
         handoff = True
     except Exception as e:
         logger.error(f"[RESTORE ERROR] {guild_id}: {e}")
-        schedule_recovery_retry(target_guild_id, state.get("voice_channel_id") if isinstance(state, dict) else None, start_position=(state.get("position", 0) if isinstance(state, dict) else 0), reason="restore_exception")
+        schedule_recovery_retry(target_guild_id, state.get("voice_channel_id"), start_position=state.get("position", 0), reason="restore_exception")
     finally:
         if not handoff:
             recovering_guilds.discard(target_guild_id)
 
-async def bootstrap_recovery_from_storage():
-    global recovery_bootstrap_started
-    if recovery_bootstrap_started:
-        return
-    recovery_bootstrap_started = True
+async def derive_recovery_state_from_db(guild_id):
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT channel_id, position_seconds, is_playing, video_url, title "
+                    "FROM harmonic_playback_state WHERE guild_id = %s AND bot_name = 'harmonic' LIMIT 1",
+                    (guild_id,),
+                )
+                playback = await cur.fetchone()
 
-    states = await load_states()
-    for gid, state in states.items():
-        bot.loop.create_task(restore_guild_state(gid, state))
+                await cur.execute(
+                    "SELECT home_vc_id FROM harmonic_bot_home_channels WHERE guild_id = %s AND bot_name = 'harmonic' LIMIT 1",
+                    (guild_id,),
+                )
+                home_row = await cur.fetchone()
 
-    try:
-        async with DBPoolManager() as pool:
-            async with pool.acquire() as conn:
-                async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("SELECT guild_id, channel_id, position_seconds FROM harmonic_playback_state WHERE is_playing = TRUE AND bot_name = %s", ('harmonic',))
+                await cur.execute(
+                    "SELECT COALESCE(connected_channel_id, last_channel_id) FROM harmonic_voice_state WHERE guild_id = %s AND bot_name = 'harmonic' AND desired_connected = TRUE LIMIT 1",
+                    (guild_id,),
+                )
+                voice_row = await cur.fetchone()
+
+                await cur.execute(
+                    "SELECT COUNT(*) FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic'",
+                    (guild_id,),
+                )
+                queue_row = await cur.fetchone()
+
+                await cur.execute(
+                    "SELECT COUNT(*) FROM harmonic_queue_backup WHERE guild_id = %s AND bot_name = 'harmonic'",
+                    (guild_id,),
+                )
+                backup_row = await cur.fetchone()
+
+    playback_channel_id = playback[0] if playback and playback[0] else None
+    playback_position = playback[1] if playback and playback[1] is not None else 0
+    playback_is_playing = bool(playback[2]) if playback else False
+    playback_url = playback[3] if playback else None
+    playback_title = playback[4] if playback else None
+    home_channel_id = home_row[0] if home_row and home_row[0] else None
+    voice_channel_id = voice_row[0] if voice_row and voice_row[0] else None
+    queue_count = queue_row[0] if queue_row else 0
+    backup_count = backup_row[0] if backup_row else 0
+
+    channel_id = playback_channel_id or voice_channel_id or home_channel_id
+    has_playback_state = bool(playback_url or playback_title)
+    has_recoverable_state = bool(channel_id and (has_playback_state or queue_count > 0 or backup_count > 0))
+    if not has_recoverable_state:
+        return None
+
+    start_position = int(playback_position or 0)
+    if not playback_is_playing and queue_count > 0:
+        start_position = 0
+
+    return {
+        "voice_channel_id": int(channel_id),
+        "position": max(0, start_position),
+    }
+
+async def bootstrap_recovery_states_from_db():
+    guild_ids = set()
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                for table_name in ("harmonic_playback_state", "harmonic_queue", "harmonic_queue_backup", "harmonic_bot_home_channels"):
+                    await cur.execute(f"SELECT DISTINCT guild_id FROM {table_name}")
                     rows = await cur.fetchall()
-    except Exception as exc:
-        logger.error(f"Startup recovery scan failed: {exc}")
-        return
+                    for row in rows or []:
+                        gid = row[0] if isinstance(row, (tuple, list)) else next(iter(row.values()), None)
+                        if gid is not None:
+                            guild_ids.add(int(gid))
 
-    for row in rows:
-        guild_id = int(row['guild_id'])
-        if guild_id in playback_tracking:
-            continue
-        await remember_recovery_state(guild_id, row.get('channel_id'), int(row.get('position_seconds') or 0))
-        bot.loop.create_task(restore_guild_state(guild_id, {"voice_channel_id": row.get('channel_id'), "position": int(row.get('position_seconds') or 0)}))
+    recovered = {}
+    for guild_id in sorted(guild_ids):
+        state = await derive_recovery_state_from_db(guild_id)
+        if state:
+            recovered[str(guild_id)] = state
+    return recovered
+
+async def bootstrap_recovery_after_ready():
+    try:
+        states = await bootstrap_recovery_states_from_db()
+        for gid, state in states.items():
+            schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
+    except Exception as e:
+        logger.error(f"Recovery bootstrap error: {e}")
 
 @tasks.loop(seconds=AUTO_HEAL_INTERVAL)
+
 async def auto_heal_loop():
     global auto_heal_initialized
 
     if not auto_heal_initialized:
-        await bootstrap_recovery_from_storage()
+        states = await load_states()
+        db_states = await bootstrap_recovery_states_from_db()
+        for gid, state in db_states.items():
+            states.setdefault(str(gid), state)
+        for gid, state in states.items():
+            schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
         auto_heal_initialized = True
 
     for gid, state in list(guild_states.items()):
@@ -1009,16 +1752,19 @@ async def auto_heal_loop():
             guild = bot.get_guild(int(gid))
             if guild:
                 vc = guild.voice_client
-                if not vc or not vc.is_connected():
-                    logger.info(f"[HEAL] Rejoining {gid}")
-                    bot.loop.create_task(restore_guild_state(gid, state))
+                if (not vc or not vc.is_connected()) or (vc and not _player_is_active(vc) and state.get("voice_channel_id")):
+                    logger.info(f"[HEAL] Rejoining/restarting playback for {gid}")
+                    if vc and not _player_is_active(vc):
+                        playback_tracking.pop(int(gid), None)
+                        recovering_guilds.discard(int(gid))
+                    schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
         except Exception:
             pass
 
 # --- BOT EVENTS & LAVALINK CONNECTION ---
 @bot.event
 async def setup_hook():
-    await init_db()
+    await init_db_with_retries()
 
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
@@ -1028,38 +1774,23 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("SELECT guild_id, channel_id, position_seconds FROM harmonic_playback_state WHERE is_playing = TRUE AND bot_name = %s", ('harmonic',))
+                    await cur.execute("SELECT guild_id, channel_id, position_seconds, video_url, title FROM harmonic_playback_state WHERE is_playing = TRUE AND bot_name = 'harmonic'")
                     orphans = await cur.fetchall()
-
-        for orphan in orphans:
-            guild = bot.get_guild(orphan['guild_id'])
-            if not guild:
-                continue
-            if guild.id in playback_tracking:
-                continue
-
-            recovered_channel_id = orphan.get('channel_id')
-            recovered_position = int(orphan.get('position_seconds') or 0)
-
-            async with DBPoolManager() as pool:
-                async with pool.acquire() as conn:
-                    async with conn.cursor(aiomysql.DictCursor) as cur:
-                        active_playback = await restore_active_playback_entry(cur, guild.id)
-                        if active_playback:
-                            recovered_channel_id = active_playback.get('channel_id') or recovered_channel_id
-                            recovered_position = max(recovered_position, int(active_playback.get('position_seconds') or 0))
-
-            if not recovered_channel_id:
-                continue
-
-            await remember_recovery_state(guild.id, recovered_channel_id, recovered_position)
-            bot.loop.create_task(restore_guild_state(guild.id, {"voice_channel_id": recovered_channel_id, "position": recovered_position}))
+                    for orphan in orphans:
+                        guild = bot.get_guild(orphan['guild_id'])
+                        if guild:
+                            vc = guild.voice_client
+                            if guild.id in recovering_guilds or guild.id in playback_tracking or (vc and (getattr(vc, 'playing', False) or getattr(vc, 'paused', False))):
+                                continue
+                            recovering_guilds.add(guild.id)
+                            await restore_active_playback_entry(cur, guild.id)
+                            asyncio.create_task(process_queue(guild, orphan['channel_id'], start_position=orphan['position_seconds']))
     except Exception as e:
         logger.error(f"Auto-resume error: {e}")
 
 @bot.event
 async def on_wavelink_node_closed(node: wavelink.Node, disconnected):
-    logger.warning(f"⚠️ Lavalink Connection Lost! Native self-healing activated...")
+    logger.warning("⚠️ Lavalink Connection Lost! Native self-healing activated...")
     ensure_lavalink_connection_task()
     for guild_id, state in list(guild_states.items()):
         schedule_recovery_retry(int(guild_id), state.get("voice_channel_id"), start_position=state.get("position", 0), reason="node_closed")
@@ -1067,14 +1798,31 @@ async def on_wavelink_node_closed(node: wavelink.Node, disconnected):
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
-    await bot.tree.sync()
-    if not position_updater.is_running(): position_updater.start()
-    
+
     ensure_lavalink_connection_task()
-    bot.loop.create_task(bootstrap_recovery_from_storage())
+
+    try:
+        await bot.tree.sync()
+    except Exception as e:
+        logger.error(f"Slash command sync failed: {e}")
+
+    if not position_updater.is_running():
+        position_updater.start()
+    if not metrics_heartbeat_loop.is_running():
+        metrics_heartbeat_loop.start()
+
+    schedule_named_task("restore_persistent_voice_states", restore_persistent_voice_states())
+    schedule_named_task("bootstrap_recovery_after_ready", bootstrap_recovery_after_ready())
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    if member == bot.user:
+        guild_id = member.guild.id
+        if after.channel is not None:
+            pending_voice_channels[guild_id] = after.channel.id
+            await persist_voice_state(guild_id, after.channel.id, desired_connected=True, connected=True)
+            await reconcile_runtime_playback_state(member.guild)
+            return
     if member == bot.user and before.channel is not None and after.channel is None:
         guild_id = member.guild.id
         pending_voice_channels.pop(guild_id, None)
@@ -1091,6 +1839,7 @@ async def on_voice_state_update(member, before, after):
             playback_tracking.pop(guild_id, None)
             recovering_guilds.discard(guild_id)
             await remember_recovery_state(guild_id, remembered_channel_id, position)
+            await mark_voice_disconnected(guild_id, remembered_channel_id, desired_connected=True, reason="voice_disconnect")
             schedule_recovery_retry(guild_id, remembered_channel_id, start_position=position, reason="voice_disconnect")
             logger.warning(f"[{guild_id}] Voice link dropped unexpectedly. Queued recovery from {position}s.")
             return
@@ -1101,7 +1850,20 @@ async def on_voice_state_update(member, before, after):
         invalidate_position_persist(guild_id)
         clear_recovery_retry(guild_id)
         clear_idle_restore_state(guild_id)
+        await mark_voice_disconnected(guild_id, getattr(before.channel, "id", None), desired_connected=False, reason="manual_or_idle_disconnect")
         await delete_state(guild_id)
+
+@tasks.loop(seconds=METRICS_HEARTBEAT_INTERVAL)
+async def metrics_heartbeat_loop():
+    for guild in list(bot.guilds):
+        try:
+            await reconcile_runtime_playback_state(guild)
+        except Exception:
+            logger.exception("[harmonic] Metrics reconcile failed for guild %s", getattr(guild, 'id', None))
+    try:
+        await collect_and_persist_metrics()
+    except Exception:
+        logger.exception("[harmonic] Metrics heartbeat failed.")
 
 @tasks.loop(seconds=POSITION_UPDATER_INTERVAL)
 async def position_updater():
@@ -1114,11 +1876,9 @@ async def position_updater():
                     if now - last_persist < POSITION_PERSIST_INTERVAL:
                         continue
                     guild = bot.get_guild(guild_id)
-                    if guild and guild.voice_client and (getattr(guild.voice_client, 'playing', False) or getattr(guild.voice_client, 'paused', False)):
-                        pos = current_track_position(guild_id, now=time.time())
-                        is_playing = bool(getattr(guild.voice_client, 'playing', False))
-                        await cur.execute("REPLACE INTO harmonic_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, title) VALUES (%s, 'harmonic', %s, %s, %s, %s, %s)", (guild_id, data['channel_id'], data['url'], pos, is_playing, data['title']))
-                        guild_states[guild_id] = {"voice_channel_id": data['channel_id'], "position": pos}
+                    if guild and guild.voice_client and getattr(guild.voice_client, 'playing', False):
+                        pos = int((time.time() - data['start_time']) * data.get('speed', 1.0) + data['offset'])
+                        await cur.execute("REPLACE INTO harmonic_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, is_paused, title) VALUES (%s, 'harmonic', %s, %s, %s, TRUE, FALSE, %s)", (guild_id, data['channel_id'], data['url'], pos, data['title']))
                         last_position_persist[guild_id] = now
 
 # --- SETTINGS COMMANDS ---
@@ -1131,7 +1891,7 @@ async def sethome(interaction: discord.Interaction, channel: discord.VoiceChanne
                 await cur.execute("REPLACE INTO harmonic_bot_home_channels (guild_id, bot_name, home_vc_id) VALUES (%s, %s, %s)", (interaction.guild.id, 'harmonic', channel.id))
     await interaction.response.send_message(embed=discord.Embed(title="🏠 Home Set", description=f"Home channel set to {channel.mention}.", color=discord.Color.green()), ephemeral=True)
 
-@bot.tree.command(name="harmonic_main_setfeedback", description="Choose the text channel where this bot posts now-playing updates, queue actions, and recovery notices.")
+@bot.tree.command(name="harmonic_main_setfeedback", description="Choose the text channel for updates, queue actions, and recovery notices.")
 @commands.has_permissions(administrator=True)
 async def setfeedback(interaction: discord.Interaction, channel: discord.TextChannel):
     await ensure_guild_settings(interaction.guild.id)
@@ -1196,8 +1956,9 @@ async def restart_bot(interaction: discord.Interaction):
     await bot.close()
     sys.exit(0)
 
+# --- COMMAND SURFACE: slash handlers should stay thin and delegate to runtime helpers above. ---
 # --- PLAYBACK COMMANDS ---
-@bot.tree.command(name="harmonic_main_play", description="Queue a track, URL, livestream, search result, or supported playlist and start playback if the bot is idle.")
+@bot.tree.command(name="harmonic_main_play", description="Queue a track, URL, livestream, search result, or playlist and start playback if idle.")
 async def play(interaction: discord.Interaction, search: str):
     interaction_token_valid = True
     try:
@@ -1223,11 +1984,11 @@ async def play(interaction: discord.Interaction, search: str):
                 await cur.execute("SELECT home_vc_id FROM harmonic_bot_home_channels WHERE guild_id = %s AND bot_name = 'harmonic'", (interaction.guild.id,))
                 res = await cur.fetchone()
                 if res and res[0]: channel = interaction.guild.get_channel(res[0])
-                    
-    if not channel: 
+
+    if not channel:
         channel = interaction.user.voice.channel if interaction.user.voice else None
 
-    if not channel: 
+    if not channel:
         await send_play_feedback(discord.Embed(title="❌ Error", description="Join a channel first or set a home channel.", color=discord.Color.red()))
         return
 
@@ -1268,14 +2029,14 @@ async def play(interaction: discord.Interaction, search: str):
 async def playnext(interaction: discord.Interaction, search: str):
     if not await is_dj(interaction): return
     await interaction.response.defer()
-    
+
     try:
         entries, _playlist_result = await search_playables(search)
         if not entries: raise ValueError("Track could not be found.")
         track = entries[0]
     except Exception as e:
         return await interaction.followup.send(embed=discord.Embed(description=f"Could not resolve that source: {e}", color=discord.Color.red()))
-        
+
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -1318,6 +2079,7 @@ async def pause(interaction: discord.Interaction):
     if not await is_dj(interaction): return
     if interaction.guild.voice_client and getattr(interaction.guild.voice_client, 'playing', False):
         await interaction.guild.voice_client.pause(True)
+        await sync_pause_state(interaction.guild.id, True)
         await interaction.response.send_message(embed=discord.Embed(description="⏸️ Paused", color=discord.Color.blue()), ephemeral=True)
     else:
         await interaction.response.send_message(embed=discord.Embed(description="❌ Nothing is currently playing.", color=discord.Color.red()), ephemeral=True)
@@ -1327,6 +2089,7 @@ async def resume(interaction: discord.Interaction):
     if not await is_dj(interaction): return
     if interaction.guild.voice_client and getattr(interaction.guild.voice_client, 'paused', False):
         await interaction.guild.voice_client.pause(False)
+        await sync_pause_state(interaction.guild.id, False)
         await interaction.response.send_message(embed=discord.Embed(description="▶️ Resumed", color=discord.Color.green()), ephemeral=True)
     else:
         await interaction.response.send_message(embed=discord.Embed(description="❌ Nothing is currently paused.", color=discord.Color.red()), ephemeral=True)
@@ -1348,7 +2111,7 @@ async def clear(interaction: discord.Interaction):
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic'", (interaction.guild.id,))
-                await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE, position_seconds = 0 WHERE guild_id = %s AND bot_name = 'harmonic'", (interaction.guild.id,))
+                await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE, is_paused = FALSE, position_seconds = 0 WHERE guild_id = %s AND bot_name = 'harmonic'", (interaction.guild.id,))
     await bot.change_presence(status=discord.Status.online)
     await interaction.response.send_message(embed=discord.Embed(description="🗑️ Playback stopped and queue cleared.", color=discord.Color.red()), ephemeral=True)
 
@@ -1363,8 +2126,8 @@ async def join(interaction: discord.Interaction):
                 await cur.execute("SELECT home_vc_id FROM harmonic_bot_home_channels WHERE guild_id = %s AND bot_name = 'harmonic'", (interaction.guild.id,))
                 res = await cur.fetchone()
                 if res and res[0]: channel = interaction.guild.get_channel(res[0])
-                    
-    if not channel: 
+
+    if not channel:
         channel = interaction.user.voice.channel if interaction.user.voice else None
 
     if channel:
@@ -1441,8 +2204,8 @@ async def remove(interaction: discord.Interaction, index: int):
             async with conn.cursor() as cur:
                 await cur.execute("SELECT id FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY id ASC LIMIT 1 OFFSET %s", (interaction.guild.id, index-1))
                 row = await cur.fetchone()
-                if row: 
-                    await cur.execute("DELETE FROM harmonic_queue WHERE id = %s", (row[0],))
+                if row:
+                    await cur.execute("DELETE FROM harmonic_queue WHERE id = %s AND guild_id = %s AND bot_name = 'harmonic'", (row[0], interaction.guild.id))
                     await interaction.response.send_message(embed=discord.Embed(description=f"Removed item #{index}", color=discord.Color.green()), ephemeral=True)
                 else: await interaction.response.send_message("Invalid index.", ephemeral=True)
 
@@ -1456,7 +2219,7 @@ async def skipto(interaction: discord.Interaction, index: int):
             async with conn.cursor() as cur:
                 await cur.execute("SELECT id FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY id ASC LIMIT %s", (interaction.guild.id, index-1))
                 rows = await cur.fetchall()
-                for r in rows: await cur.execute("DELETE FROM harmonic_queue WHERE id = %s", (r[0],))
+                for r in rows: await cur.execute("DELETE FROM harmonic_queue WHERE id = %s AND guild_id = %s AND bot_name = 'harmonic'", (r[0], interaction.guild.id))
     if interaction.guild.voice_client: await interaction.guild.voice_client.stop()
     await interaction.response.send_message(embed=discord.Embed(description=f"Skipped to #{index}", color=discord.Color.green()), ephemeral=True)
 
@@ -1468,9 +2231,16 @@ async def move(interaction: discord.Interaction, frm: int, to: int):
             async with conn.cursor() as cur:
                 await cur.execute("SELECT id, video_url, title, requester_id FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY id ASC", (interaction.guild.id,))
                 q = list(await cur.fetchall())
-                if frm > len(q) or to > len(q) or frm < 1 or to < 1: return await interaction.response.send_message("Invalid index", ephemeral=True)
-                item = q.pop(frm-1)
-                q.insert(to-1, item)
+                if frm > len(q) or to > len(q) or frm < 1 or to < 1:
+                    return await interaction.response.send_message("Invalid index", ephemeral=True)
+                item = q.pop(frm - 1)
+                # After popping a lower index, later positions shift left by one.
+                # Example: move #2 to #5 in a 5-item queue should insert after the
+                # new #4, not before it.
+                insert_at = to - 1
+                if frm < to:
+                    insert_at = to - 2
+                q.insert(max(0, min(insert_at, len(q))), item)
                 await cur.execute("DELETE FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic'", (interaction.guild.id,))
                 for r in q:
                     await enqueue_track(cur, interaction.guild.id, r[1], r[2], r[3], backup=False)
@@ -1490,7 +2260,7 @@ async def bump(interaction: discord.Interaction, index: int):
                 row = await cur.fetchone()
                 if not row:
                     return await interaction.response.send_message("Invalid index.", ephemeral=True)
-                await cur.execute("DELETE FROM harmonic_queue WHERE id = %s", (row[0],))
+                await cur.execute("DELETE FROM harmonic_queue WHERE id = %s AND guild_id = %s AND bot_name = 'harmonic'", (row[0], interaction.guild.id))
                 await insert_queue_front(cur, "harmonic_queue", interaction.guild.id, "harmonic", row[1], row[2], row[3])
     await interaction.response.send_message(embed=discord.Embed(description=f"⬆️ Moved **{row[2]}** to play next.", color=discord.Color.green()), ephemeral=True)
 
@@ -1824,11 +2594,13 @@ async def panel(interaction: discord.Interaction):
             if not await is_dj(i): return
             vc = i.guild.voice_client
             if vc:
-                if getattr(vc, 'playing', False): 
+                if getattr(vc, 'playing', False):
                     await vc.pause(True)
+                    await sync_pause_state(i.guild.id, True)
                     await i.response.send_message("⏸️ Playback Paused", ephemeral=True)
-                else: 
+                else:
                     await vc.pause(False)
+                    await sync_pause_state(i.guild.id, False)
                     await i.response.send_message("▶️ Playback Resumed", ephemeral=True)
             else: await i.response.send_message("Nothing is playing.", ephemeral=True)
         @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, row=0)
@@ -1840,7 +2612,7 @@ async def panel(interaction: discord.Interaction):
         @discord.ui.button(label="⏭️ Skip", style=discord.ButtonStyle.secondary, row=0)
         async def sk(self, i: discord.Interaction, b: discord.ui.Button):
             if not await is_dj(i): return
-            if i.guild.voice_client: 
+            if i.guild.voice_client:
                 await i.guild.voice_client.stop()
                 await i.response.send_message("⏭️ Skipped to next track", ephemeral=True)
             else: await i.response.send_message("Nothing to skip.", ephemeral=True)
@@ -1914,7 +2686,7 @@ async def nowplaying(interaction: discord.Interaction):
             embed.add_field(name="Requested by", value=requester_name, inline=True)
         embed.add_field(name="Filter", value=str(data.get('current_filter', 'none')), inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
-    else: 
+    else:
         await interaction.response.send_message(embed=discord.Embed(description="Nothing playing.", color=discord.Color.red()), ephemeral=True)
 
 @bot.tree.command(name="harmonic_main_ping", description="Show the bot websocket latency so you can quickly check responsiveness.")
@@ -2048,9 +2820,9 @@ async def playlist_sync_loop():
 
     for guild_id, url, known_count, req_id, channel_id in playlists:
         try:
-            data = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+            data = await loop.run_in_executor(None, lambda playlist_url=url: ydl.extract_info(playlist_url, download=False))
             if not data or 'entries' not in data: continue
-        
+
             entries = [e for e in data['entries'] if e is not None]
             current_count = len(entries)
 
@@ -2067,7 +2839,7 @@ async def playlist_sync_loop():
                                 if t_url:
                                     await enqueue_track(cur, guild_id, t_url, t_title, req_id)
                                     added_count += 1
-                            await cur.execute("UPDATE harmonic_active_playlists SET known_track_count = %s WHERE guild_id = %s", (current_count, guild_id))
+                            await cur.execute("UPDATE harmonic_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'harmonic'", (current_count, guild_id))
 
                 guild = bot.get_guild(guild_id)
                 if guild:
@@ -2075,9 +2847,9 @@ async def playlist_sync_loop():
                     if added_count > 0 and (not vc or (not getattr(vc, 'playing', False) and not getattr(vc, 'paused', False))):
                         target_channel = vc.channel if vc and getattr(vc, 'channel', None) else guild.get_channel(channel_id) if channel_id else await get_home_channel(guild)
                         if target_channel:
-                            bot.loop.create_task(process_queue(guild, target_channel.id))
+                            schedule_named_task(f"playlist_sync_process_queue:{guild.id}", process_queue(guild, target_channel.id))
                     embed = discord.Embed(title="📡 Playlist Updated", description=f"Detected **{current_count - known_count}** new tracks added to the monitored playlist! Auto-queued them.", color=discord.Color.green())
-                    await send_feedback(guild, embed)
+                    await send_or_update_status_message(guild, embed)
                     await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📡 Playlist Sync", f"Detected **{current_count - known_count}** new tracks for guild {guild.name} and queued them automatically.", discord.Color.green())
         except Exception as e:
             logger.error(f"Sync Loop Error: {e}")
@@ -2092,35 +2864,39 @@ bot.add_listener(on_ready_sync, 'on_ready')
 @tasks.loop(seconds=2.0)
 async def aria_command_listener():
     try:
+        await ensure_swarm_command_tables()
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("SELECT guild_id, command FROM harmonic_swarm_overrides WHERE bot_name = %s", ('harmonic',))
+                    await cur.execute("SELECT guild_id, command, COALESCE(attempts, 0) AS attempts FROM harmonic_swarm_overrides WHERE bot_name = %s", ('harmonic',))
                     commands = await cur.fetchall()
 
         if not commands: return
 
         for row in commands:
             guild_id = row['guild_id']
-            cmd = row['command']
+            cmd = str(row['command'] or '').upper()
+            attempts = int(row.get('attempts', 0) or 0)
+
             if cmd == 'RESTART':
-                logger.warning('[harmonic] Restart command received from swarm override listener. Restarting process...')
+                logger.warning("[harmonic] Restart override received; exiting for container supervisor restart.")
                 async with DBPoolManager() as pool:
                     async with pool.acquire() as conn:
                         async with conn.cursor() as cur:
-                            await cur.execute("DELETE FROM harmonic_swarm_overrides WHERE bot_name = %s", ('harmonic',))
+                            await cur.execute("DELETE FROM harmonic_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'harmonic'))
                 await bot.close()
                 sys.exit(0)
+
             guild = bot.get_guild(guild_id)
             vc = guild.voice_client if guild else None
             executed = False
 
             if guild:
                 if cmd == 'PAUSE' and vc and getattr(vc, 'playing', False):
-                    await vc.pause(True); executed = True
+                    await vc.pause(True); await sync_pause_state(guild_id, True); executed = True
                 elif cmd == 'RESUME' and vc and getattr(vc, 'paused', False):
-                    await vc.resume(); executed = True
-                elif cmd == 'SKIP' and vc and (getattr(vc, 'playing', False) or getattr(vc, 'paused', False)):
+                    await vc.pause(False); await sync_pause_state(guild_id, False); executed = True
+                elif cmd == 'SKIP' and vc:
                     await vc.stop(); executed = True
                 elif cmd == 'STOP':
                     snooze_auto_restore(guild_id)
@@ -2156,7 +2932,10 @@ async def aria_command_listener():
             async with DBPoolManager() as pool:
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute("DELETE FROM harmonic_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'harmonic'))
+                        if executed or attempts >= 2 or not guild:
+                            await cur.execute("DELETE FROM harmonic_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'harmonic'))
+                        else:
+                            await cur.execute("UPDATE harmonic_swarm_overrides SET attempts = COALESCE(attempts, 0) + 1, last_error = %s WHERE guild_id = %s AND bot_name = %s", (f"state_mismatch:{cmd}", guild_id, 'harmonic'))
     except Exception:
         logger.exception("Aria override listener failed for harmonic.")
 
@@ -2164,6 +2943,33 @@ async def aria_command_listener():
 async def on_ready_aria_listener():
     if not aria_command_listener.is_running(): aria_command_listener.start()
 bot.add_listener(on_ready_aria_listener, 'on_ready')
+
+
+async def ensure_swarm_command_tables():
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_swarm_overrides (guild_id BIGINT, bot_name VARCHAR(50), command VARCHAR(20), PRIMARY KEY(guild_id, bot_name))")
+                    await cur.execute("CREATE TABLE IF NOT EXISTS harmonic_swarm_direct_orders (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50), guild_id BIGINT, vc_id BIGINT NULL, text_channel_id BIGINT NULL, command VARCHAR(50), data TEXT NULL)")
+                    for stmt in [
+                        "ALTER TABLE harmonic_swarm_overrides ADD COLUMN bot_name VARCHAR(50) DEFAULT 'harmonic'",
+                        "ALTER TABLE harmonic_swarm_overrides ADD COLUMN command VARCHAR(20) NULL",
+                        "ALTER TABLE harmonic_swarm_direct_orders ADD COLUMN vc_id BIGINT NULL",
+                        "ALTER TABLE harmonic_swarm_direct_orders ADD COLUMN text_channel_id BIGINT NULL",
+                        "ALTER TABLE harmonic_swarm_direct_orders ADD COLUMN command VARCHAR(50) NULL",
+                        "ALTER TABLE harmonic_swarm_direct_orders ADD COLUMN data TEXT NULL",
+                        "ALTER TABLE harmonic_swarm_overrides ADD COLUMN attempts INT NOT NULL DEFAULT 0",
+                        "ALTER TABLE harmonic_swarm_overrides ADD COLUMN last_error TEXT NULL",
+                        "ALTER TABLE harmonic_swarm_direct_orders ADD COLUMN attempts INT NOT NULL DEFAULT 0",
+                        "ALTER TABLE harmonic_swarm_direct_orders ADD COLUMN last_error TEXT NULL",
+                    ]:
+                        try:
+                            await cur.execute(stmt)
+                        except Exception:
+                            pass
+    except Exception:
+        logger.exception("Failed ensuring swarm command tables for harmonic.")
 
 # --- AUTOMATED BACKGROUND MAINTENANCE ---
 @tasks.loop(seconds=15.0)
@@ -2218,7 +3024,7 @@ async def resilience_loop():
                         clear_idle_restore_state(guild.id)
                         schedule_recovery_retry(guild.id, target_channel_id, start_position=0, reason="idle_restore")
                         logger.info(f"[{guild.id}] Restored {restored} backup tracks after idle/home recovery.")
-                        bot.loop.create_task(process_queue(guild, target_channel_id))
+                        asyncio.create_task(process_queue(guild, target_channel_id))
     except Exception as e:
         logger.error(f"Resilience Loop Error: {e}")
 
@@ -2245,9 +3051,9 @@ async def zombie_reaper_loop():
                                         if restored > 0:
                                             clear_idle_restore_state(guild.id)
                                             schedule_recovery_retry(guild.id, recovery_channel_id, start_position=0, reason="zombie_restore")
-                                            bot.loop.create_task(process_queue(guild, recovery_channel_id))
+                                            asyncio.create_task(process_queue(guild, recovery_channel_id))
                                     playback_tracking.pop(guild.id, None)
-                                    await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
+                                    await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
                                     continue
                                 await cur.execute("SELECT stay_in_vc FROM harmonic_guild_settings WHERE guild_id = %s", (guild.id,))
                                 cfg = await cur.fetchone()
@@ -2256,7 +3062,7 @@ async def zombie_reaper_loop():
                                     await stop_playback(guild)
                                 else:
                                     playback_tracking.pop(guild.id, None)
-                                    await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
+                                    await cur.execute("UPDATE harmonic_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'harmonic'", (guild.id,))
             except: pass
 
 @tasks.loop(hours=24.0)
@@ -2284,10 +3090,11 @@ bot.add_listener(on_ready_maintenance, 'on_ready')
 @tasks.loop(seconds=2.0)
 async def direct_order_listener():
     try:
+        await ensure_swarm_command_tables()
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("SELECT * FROM harmonic_swarm_direct_orders WHERE bot_name = %s", ('harmonic',))
+                    await cur.execute("SELECT id, bot_name, guild_id, vc_id, text_channel_id, command, data, COALESCE(attempts, 0) AS attempts FROM harmonic_swarm_direct_orders WHERE bot_name = %s ORDER BY id ASC", ('harmonic',))
                     orders = await cur.fetchall()
 
         if not orders: return
@@ -2295,10 +3102,10 @@ async def direct_order_listener():
         for order in orders:
             oid = order['id']
             guild = bot.get_guild(order['guild_id'])
-            cmd = order['command']
+            cmd = str(order['command'] or '').upper()
             data = order['data']
+            attempts = int(order.get('attempts', 0) or 0)
             executed = False
-            remove_order = True
 
             if guild:
                 vc_target = guild.get_channel(order['vc_id']) if order.get('vc_id') is not None and order['vc_id'] else None
@@ -2308,12 +3115,7 @@ async def direct_order_listener():
                         vc_target = await get_home_channel(guild)
 
                     if vc_target:
-                        voice_client = await ensure_voice_connection(guild, vc_target.id)
-                        if voice_client is None:
-                            remove_order = False
-                            ensure_lavalink_connection_task()
-                            logger.warning(f"[{guild.id}] Deferring direct PLAY order {oid} until voice/Lavalink is ready.")
-                            continue
+                        await ensure_voice_connection(guild, vc_target.id)
                         try:
                             entries, playlist_result = await search_playables(data)
                             if entries:
@@ -2336,18 +3138,56 @@ async def direct_order_listener():
                                         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📥 Matrix Loaded", f"Aria routed a payload of **{added_count}** tracks directly into `{guild.name}`.", discord.Color.blue())
                                     except: pass
                         except Exception as e:
-                            message = str(e)
-                            if "Lavalink is still starting up" in message or "No nodes are currently assigned to the wavelink.Pool in a CONNECTED state" in message:
-                                remove_order = False
-                                ensure_lavalink_connection_task()
-                                logger.warning(f"Direct PLAY order {oid} delayed while Lavalink reconnects: {message}")
-                                continue
                             logger.error(f"Direct Play Extractor Error: {e}")
 
                         if executed and guild.voice_client and not getattr(guild.voice_client, 'playing', False) and not getattr(guild.voice_client, 'paused', False):
-                            bot.loop.create_task(process_queue(guild, vc_target.id))
+                            schedule_named_task(f"direct_play_process_queue:{guild.id}", process_queue(guild, vc_target.id))
                     else:
                         logger.warning("[harmonic] Dropped direct PLAY order %s for guild %s because no voice channel was resolved.", oid, guild.id)
+
+                elif cmd == 'PAUSE':
+                    vc = guild.voice_client
+                    if vc and getattr(vc, 'playing', False):
+                        await vc.pause(True)
+                        await sync_pause_state(guild.id, True)
+                        executed = True
+                    else:
+                        logger.info(f"[{guild.id}] Direct PAUSE ignored because nothing is currently playing.")
+
+                elif cmd == 'RESUME':
+                    vc = guild.voice_client
+                    if vc and getattr(vc, 'paused', False):
+                        await vc.pause(False)
+                        await sync_pause_state(guild.id, False)
+                        executed = True
+                    else:
+                        logger.info(f"[{guild.id}] Direct RESUME ignored because the player is not paused.")
+
+                elif cmd == 'SKIP':
+                    vc = guild.voice_client
+                    if vc and (getattr(vc, 'playing', False) or getattr(vc, 'paused', False)):
+                        await vc.stop()
+                        executed = True
+                    else:
+                        logger.info(f"[{guild.id}] Direct SKIP ignored because no active player exists.")
+
+                elif cmd == 'STOP':
+                    snooze_auto_restore(guild.id)
+                    await clear_active_playlist(guild.id)
+                    await stop_playback(guild)
+                    executed = True
+
+                elif cmd == 'RECOVER':
+                    state = await derive_recovery_state_from_db(guild.id)
+                    recover_channel_id = order.get('vc_id') or (state or {}).get('voice_channel_id')
+                    if recover_channel_id:
+                        recover_state = dict(state or {})
+                        recover_state['voice_channel_id'] = recover_channel_id
+                        recover_state['position'] = int((state or {}).get('position', 0) or 0)
+                        await restore_guild_state(guild.id, recover_state)
+                        executed = True
+                    else:
+                        logger.warning("[harmonic] Could not resolve RECOVER target for guild %s.", guild.id)
 
                 elif cmd == 'LEAVE':
                     force_leave = isinstance(data, str) and data.strip().lower() in {'force', 'override', 'admin'}
@@ -2359,9 +3199,15 @@ async def direct_order_listener():
                         await stop_playback(guild)
                         executed = True
 
+                else:
+                    logger.warning(f"[harmonic] Unsupported direct order {cmd!r} for guild {guild.id}.")
+
                 if executed:
                     try:
-                        await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "🤖 Direct Drone Execution", f"Received and executed direct `{cmd}` order from Aria in `{guild.name}`.", discord.Color.purple())
+                        details = f" command=`{cmd}`"
+                        if cmd == 'RECOVER' and data:
+                            details += f" | payload={str(data)[:160]}"
+                        await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "🤖 Direct Drone Execution", f"Received and executed direct `{cmd}` order from Aria in `{guild.name}`.{details}", discord.Color.purple())
                     except Exception:
                         logger.exception("[harmonic] Failed sending direct order webhook for guild %s.", guild.id)
                 else:
@@ -2369,11 +3215,13 @@ async def direct_order_listener():
             else:
                 logger.warning("[harmonic] Received direct order %s for unknown guild %s.", cmd, order['guild_id'])
 
-            if remove_order:
-                async with DBPoolManager() as pool:
-                    async with pool.acquire() as conn:
-                        async with conn.cursor() as cur:
+            async with DBPoolManager() as pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        if executed or attempts >= 2 or not guild:
                             await cur.execute("DELETE FROM harmonic_swarm_direct_orders WHERE id = %s", (oid,))
+                        else:
+                            await cur.execute("UPDATE harmonic_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s WHERE id = %s", (f"unexecuted:{cmd}", oid))
 
     except Exception:
         logger.exception("Direct order listener failed for harmonic.")
@@ -2397,24 +3245,49 @@ class SwarmIntelligence(commands.Cog):
         self.heartbeat.cancel()
         self.watchdog.cancel()
 
+    async def _best_presence_title(self):
+        """Choose live track title for bot status without falling back to idle too early."""
+        reconnect_candidate = None
+        for guild in self.bot.guilds:
+            vc = guild.voice_client
+            connected = _voice_client_connected(vc)
+            tracked = playback_tracking.get(guild.id) or {}
+            if connected:
+                title = tracked.get("title") or _track_title_from_obj(_player_current_track(vc))
+                if title:
+                    return str(title).replace("\n", " ").strip(), guild.name
+                try:
+                    async with DBPoolManager() as pool:
+                        async with pool.acquire() as conn:
+                            async with conn.cursor(aiomysql.DictCursor) as cur:
+                                await cur.execute(
+                                    f"SELECT title, is_playing, is_paused FROM {self.bot_name}_playback_state WHERE guild_id = %s AND bot_name = %s AND (is_playing = TRUE OR is_paused = TRUE) ORDER BY is_playing DESC LIMIT 1",
+                                    (guild.id, self.bot_name),
+                                )
+                                row = await cur.fetchone()
+                                if row and row.get("title"):
+                                    return str(row["title"]).replace("\n", " ").strip(), guild.name
+                except Exception as exc:
+                    logger.debug("[%s] Presence DB lookup failed for guild %s: %s", self.bot_name, guild.id, exc)
+            elif tracked.get("title"):
+                try:
+                    started = float(tracked.get("start_time") or 0)
+                except Exception:
+                    started = 0
+                if time.time() - started < 120:
+                    reconnect_candidate = (str(tracked["title"]).replace("\n", " ").strip(), guild.name)
+        return reconnect_candidate or (None, None)
+
     @tasks.loop(seconds=15)
     async def status_updater(self):
         try:
-            for guild in self.bot.guilds:
-                if guild.voice_client and getattr(guild.voice_client, 'playing', False):
-                    track_title = playback_tracking.get(guild.id, {}).get("title")
-                    if not track_title:
-                        async with DBPoolManager() as pool:
-                            async with pool.acquire() as conn:
-                                async with conn.cursor(aiomysql.DictCursor) as cur:
-                                    await cur.execute("SELECT title FROM harmonic_playback_state WHERE guild_id = %s AND bot_name = 'harmonic' AND is_playing = TRUE LIMIT 1", (guild.id,))
-                                    res = await cur.fetchone()
-                                    track_title = res["title"] if res else None
-                    if track_title:
-                        await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=f"{track_title[:20]} in {guild.name}"))
-                        return
-            await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="the Swarm | Idle"))
-        except: pass
+            title, guild_name = await self._best_presence_title()
+            if title:
+                await self.bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\n", " ").strip()[:120]))
+                return
+            await self.bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="the Swarm | Idle"))
+        except Exception:
+            logger.exception("[%s] Status updater failed.", self.bot_name)
 
     @tasks.loop(seconds=30)
     async def heartbeat(self):
@@ -2423,7 +3296,8 @@ class SwarmIntelligence(commands.Cog):
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute("INSERT INTO swarm_health (bot_name, status, last_pulse) VALUES (%s, 'HEALTHY', NOW()) ON DUPLICATE KEY UPDATE status=VALUES(status), last_pulse=NOW()", (self.bot_name,))
-        except: pass
+        except Exception:
+            logger.exception("[harmonic] Heartbeat update failed.")
 
     @tasks.loop(seconds=15)
     async def watchdog(self):
@@ -2461,7 +3335,7 @@ class SwarmIntelligence(commands.Cog):
                                         track_info['start_time'] = now
                                         track_info['offset'] = current_pos
                                         await send_webhook_log(self.bot.user.name if self.bot.user else "Unknown Node", "⚙️ Watchdog Revival", f"Detected playback stall in `{guild.name}`. Recovering track safely at {current_pos}s.", discord.Color.orange())
-                                        self.bot.loop.create_task(process_queue(guild, track_info.get('channel_id'), start_position=current_pos))
+                                        asyncio.create_task(process_queue(guild, track_info.get('channel_id'), start_position=current_pos))
         except: pass
 
     @status_updater.before_loop
@@ -2502,14 +3376,48 @@ async def global_proximity_shield(interaction: discord.Interaction):
 def validate_runtime_config():
     required = {
         f"{BOT_ENV_PREFIX}_DISCORD_TOKEN": TOKEN,
-        f"{BOT_ENV_PREFIX}_DB_PASSWORD": DB_CONFIG.get('password'),
         f"{BOT_ENV_PREFIX}_LAVALINK_PASSWORD": LAVALINK_PASSWORD,
     }
     missing = [name for name, value in required.items() if not value]
     if missing: raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
+
+@bot.event
+async def on_command_error(ctx, error):
+    dispatch_runtime_error(
+        'Discord Command Error',
+        error,
+        description=f"{ctx.command.qualified_name if ctx.command else 'unknown_command'} failed in guild {getattr(ctx.guild, 'id', 'DM')}",
+        guild_id=getattr(ctx.guild, 'id', None),
+        error_type='discord_command',
+    )
+
+
+@bot.event
+async def on_error(event_method, *args, **kwargs):
+    exc_type, exc, tb = sys.exc_info()
+    dispatch_runtime_error(
+        f'Discord Event Error: {event_method}',
+        exc,
+        description=f'Unhandled Discord event failure in {event_method}',
+        traceback_text=''.join(__import__('traceback').format_exception(exc_type, exc, tb)) if exc_type else None,
+        error_type='discord_event',
+    )
+
+
+@bot.event
+async def on_ready_error_reporting():
+    install_error_reporting()
+    try:
+        asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
+    except Exception:
+        pass
+bot.add_listener(on_ready_error_reporting, 'on_ready')
+
+
 def main():
     validate_runtime_config()
+    install_error_reporting()
     bot.run(TOKEN)
 
 if __name__ == "__main__":
