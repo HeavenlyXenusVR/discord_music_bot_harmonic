@@ -168,6 +168,24 @@ def _player_is_playing(player):
     """
     if not player:
         return False
+    current_track = _player_current_track(player)
+    if current_track is None:
+        return False
+    paused = False
+    for attr in ("paused", "is_paused"):
+        value = getattr(player, attr, None)
+        try:
+            if callable(value):
+                value = value()
+        except TypeError:
+            pass
+        except Exception:
+            value = None
+        if isinstance(value, bool):
+            paused = value
+            break
+    if paused:
+        return False
     for attr in ("playing", "is_playing"):
         value = getattr(player, attr, None)
         try:
@@ -179,12 +197,12 @@ def _player_is_playing(player):
             value = None
         if isinstance(value, bool) and value:
             return True
-    if _player_current_track(player) is not None and not _player_is_paused(player):
-        return True
-    return False
+    return True
 
 def _player_is_paused(player):
     if not player:
+        return False
+    if _player_current_track(player) is None:
         return False
     for attr in ("paused", "is_paused"):
         value = getattr(player, attr, None)
@@ -583,7 +601,7 @@ async def lavalink_health_monitor():
             ensure_lavalink_connection_task()
             for guild in bot.guilds:
                 vc = guild.voice_client
-                if vc and not getattr(vc, "playing", False) and not getattr(vc, "paused", False):
+                if vc and not _player_is_active(vc):
                     state = await derive_recovery_state_from_db(guild.id)
                     channel_id = (state or {}).get("voice_channel_id") or getattr(getattr(vc, "channel", None), "id", None)
                     if channel_id:
@@ -1579,10 +1597,12 @@ async def process_queue(guild, channel_id, start_position=0):
     lock = get_process_queue_lock(guild.id)
     async with lock:
         vc = guild.voice_client
-        if vc and _player_is_playing(vc):
-            return
-        if vc and _player_is_paused(vc) and start_position <= 0:
-            return
+        current_track = _player_current_track(vc) if vc else None
+        if vc and current_track is not None:
+            if _player_is_playing(vc):
+                return
+            if _player_is_paused(vc) and start_position <= 0:
+                return
         return await _process_queue_inner(guild, channel_id, start_position=start_position)
 
 async def stop_playback(guild):
@@ -2076,7 +2096,7 @@ async def playnext(interaction: discord.Interaction, search: str):
 async def skip(interaction: discord.Interaction):
     if not await is_dj(interaction): return
     # FIX: Account for silent failures when nothing is playing
-    if interaction.guild.voice_client and (getattr(interaction.guild.voice_client, 'playing', False) or getattr(interaction.guild.voice_client, 'paused', False)):
+    if interaction.guild.voice_client and _player_is_active(interaction.guild.voice_client):
         await interaction.guild.voice_client.stop()
         await interaction.response.send_message(embed=discord.Embed(description="⏭️ Skipped", color=discord.Color.blurple()), ephemeral=True)
     else:
@@ -2093,7 +2113,7 @@ async def stop(interaction: discord.Interaction):
 @bot.tree.command(name="harmonic_main_pause", description="Pause the current track without clearing the queue or playback position.")
 async def pause(interaction: discord.Interaction):
     if not await is_dj(interaction): return
-    if interaction.guild.voice_client and getattr(interaction.guild.voice_client, 'playing', False):
+    if interaction.guild.voice_client and _player_is_playing(interaction.guild.voice_client):
         await interaction.guild.voice_client.pause(True)
         await sync_pause_state(interaction.guild.id, True)
         await interaction.response.send_message(embed=discord.Embed(description="⏸️ Paused", color=discord.Color.blue()), ephemeral=True)
@@ -2103,7 +2123,7 @@ async def pause(interaction: discord.Interaction):
 @bot.tree.command(name="harmonic_main_resume", description="Resume the paused track from its current playback position.")
 async def resume(interaction: discord.Interaction):
     if not await is_dj(interaction): return
-    if interaction.guild.voice_client and getattr(interaction.guild.voice_client, 'paused', False):
+    if interaction.guild.voice_client and _player_is_paused(interaction.guild.voice_client):
         await interaction.guild.voice_client.pause(False)
         await sync_pause_state(interaction.guild.id, False)
         await interaction.response.send_message(embed=discord.Embed(description="▶️ Resumed", color=discord.Color.green()), ephemeral=True)
@@ -2115,7 +2135,7 @@ async def clear(interaction: discord.Interaction):
     if not await is_dj(interaction): return
     snooze_auto_restore(interaction.guild.id)
     vc = interaction.guild.voice_client
-    if vc and (getattr(vc, "playing", False) or getattr(vc, "paused", False)):
+    if vc and _player_is_active(vc):
         try: await vc.stop()
         except Exception: pass
     playback_tracking.pop(interaction.guild.id, None)
