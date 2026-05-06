@@ -479,6 +479,7 @@ MAX_RECOVERY_RETRIES = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_MAX_RECOVERY_RETR
 WATCHDOG_REVIVAL_COOLDOWN = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_REVIVAL_COOLDOWN", "15")))
 WATCHDOG_MAX_REVIVALS = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_MAX_REVIVALS", "6")))
 AUTO_RESTORE_SNOOZE_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_RESTORE_SNOOZE_SECONDS", "180")))
+RECOVERY_EXHAUSTED_COOLDOWN_SECONDS = max(120.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_EXHAUSTED_COOLDOWN_SECONDS", "600")))
 PERIODIC_RESTART_HOURS = max(1.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PERIODIC_RESTART_HOURS", os.getenv("PERIODIC_RESTART_HOURS", "5"))))
 
 intents = discord.Intents.default()
@@ -495,6 +496,7 @@ playlist_db_initialized = False
 playlist_db_lock = asyncio.Lock()
 recovery_retry_tasks = {}
 recovery_retry_counts = {}
+recovery_exhausted_until = {}
 idle_voice_since = {}
 auto_restore_snooze_until = {}
 startup_task_registry = {}
@@ -881,6 +883,24 @@ def clear_auto_restore_snooze(guild_id):
 def snooze_auto_restore(guild_id, seconds=AUTO_RESTORE_SNOOZE_SECONDS):
     auto_restore_snooze_until[guild_id] = time.time() + seconds
 
+def recovery_backoff_remaining(guild_id):
+    remaining = recovery_exhausted_until.get(guild_id, 0) - time.time()
+    if remaining <= 0:
+        recovery_exhausted_until.pop(guild_id, None)
+        return 0
+    return int(max(1, remaining))
+
+def clear_recovery_backoff(guild_id):
+    recovery_exhausted_until.pop(guild_id, None)
+
+def arm_recovery_backoff(guild_id, *, seconds=RECOVERY_EXHAUSTED_COOLDOWN_SECONDS, reason="recovery_exhausted"):
+    cooldown = max(30.0, float(seconds))
+    recovery_exhausted_until[guild_id] = time.time() + cooldown
+    playback_tracking.pop(guild_id, None)
+    recovering_guilds.discard(guild_id)
+    snooze_auto_restore(guild_id, cooldown)
+    logger.warning(f"[{guild_id}] Recovery paused for {int(cooldown)}s after {reason}.")
+
 def clear_idle_restore_state(guild_id):
     idle_voice_since.pop(guild_id, None)
 
@@ -1216,17 +1236,21 @@ async def restore_active_playback_entry(cur, guild_id, requester_id=None):
 
 def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="recovery"):
     if not channel_id:
-        return
+        return False
+
+    if recovery_backoff_remaining(guild_id) > 0:
+        return False
 
     existing = recovery_retry_tasks.get(guild_id)
     if existing and not existing.done():
-        return
+        return False
 
     attempts = recovery_retry_counts.get(guild_id, 0) + 1
     if attempts > MAX_RECOVERY_RETRIES:
-        recovery_retry_counts.pop(guild_id, None)
+        clear_recovery_retry(guild_id)
+        arm_recovery_backoff(guild_id, reason=f"{reason}_exhausted")
         logger.error(f"[{guild_id}] Exhausted recovery retries after {MAX_RECOVERY_RETRIES} attempts ({reason}).")
-        return
+        return False
 
     recovery_retry_counts[guild_id] = attempts
     delay = min(RECOVERY_RETRY_BASE_DELAY * attempts, RECOVERY_RETRY_MAX_DELAY)
@@ -1257,6 +1281,7 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
 
     current_task = asyncio.create_task(_retry())
     recovery_retry_tasks[guild_id] = current_task
+    return True
 
 async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_id, *, position=0, reason="recovery"):
     await insert_queue_front(cur, "harmonic_queue", guild_id, "harmonic", url, title, requester_id)
@@ -1438,6 +1463,7 @@ async def ensure_voice_connection(guild, channel_id):
                 except Exception: pass
 
         await persist_voice_state(guild.id, channel_id, desired_connected=True, connected=True)
+        clear_recovery_backoff(guild.id)
 
         return voice_client
     except Exception as e:
@@ -1636,6 +1662,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                 guild_states[guild.id] = {"voice_channel_id": channel_id, "position": start_position}
                 invalidate_position_persist(guild.id)
                 clear_recovery_retry(guild.id)
+                clear_recovery_backoff(guild.id)
                 clear_auto_restore_snooze(guild.id)
                 clear_idle_restore_state(guild.id)
                 await save_state(guild.id)
@@ -1681,6 +1708,9 @@ async def restore_guild_state(guild_id, state):
     target_guild_id = int(guild_id)
     guild = bot.get_guild(target_guild_id)
     vc = guild.voice_client if guild else None
+
+    if recovery_backoff_remaining(target_guild_id) > 0 and not (vc and _player_is_active(vc)):
+        return
 
     if target_guild_id in recovering_guilds:
         if vc and _player_is_playing(vc):
@@ -1839,6 +1869,8 @@ async def auto_heal_loop():
 
     for gid, state in list(guild_states.items()):
         try:
+            if recovery_backoff_remaining(int(gid)) > 0:
+                continue
             guild = bot.get_guild(int(gid))
             if guild:
                 vc = guild.voice_client
@@ -1930,8 +1962,13 @@ async def on_voice_state_update(member, before, after):
             recovering_guilds.discard(guild_id)
             await remember_recovery_state(guild_id, remembered_channel_id, position)
             await mark_voice_disconnected(guild_id, remembered_channel_id, desired_connected=True, reason="voice_disconnect")
-            schedule_recovery_retry(guild_id, remembered_channel_id, start_position=position, reason="voice_disconnect")
-            logger.warning(f"[{guild_id}] Voice link dropped unexpectedly. Queued recovery from {position}s.")
+            scheduled = schedule_recovery_retry(guild_id, remembered_channel_id, start_position=position, reason="voice_disconnect")
+            if scheduled:
+                logger.warning(f"[{guild_id}] Voice link dropped unexpectedly. Queued recovery from {position}s.")
+            else:
+                remaining = recovery_backoff_remaining(guild_id)
+                if remaining > 0:
+                    logger.warning(f"[{guild_id}] Voice link dropped unexpectedly, but recovery is paused for another {remaining}s.")
             return
 
         playback_tracking.pop(guild_id, None)
@@ -3453,6 +3490,8 @@ class SwarmIntelligence(commands.Cog):
     async def watchdog(self):
         try:
             for guild in self.bot.guilds:
+                if recovery_backoff_remaining(guild.id) > 0:
+                    continue
                 vc = guild.voice_client
                 if vc and not getattr(vc, 'playing', False) and not getattr(vc, 'paused', False):
                     if guild.id in playback_tracking:
