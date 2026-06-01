@@ -2036,7 +2036,11 @@ async def init_db():
                 await safe_schema_execute(cur, "CREATE INDEX harmonic_playback_track_uid_idx ON harmonic_playback_state (bot_name, track_uid)")
                 await safe_schema_execute(cur, "CREATE INDEX harmonic_playlist_bot_idx ON harmonic_active_playlists (bot_name, guild_id)")
                 await safe_schema_execute(cur, "CREATE INDEX harmonic_playlist_track_uid_idx ON harmonic_active_playlist_tracks (guild_id, bot_name, track_uid)")
+                await safe_schema_execute(cur, "CREATE INDEX harmonic_active_playlist_tracks_guild_bot_idx ON harmonic_active_playlist_tracks (guild_id, bot_name, position_idx)")
+                await safe_schema_execute(cur, "CREATE INDEX harmonic_active_playlist_tracks_del_idx ON harmonic_active_playlist_tracks (guild_id, bot_name, playlist_url(255))")
                 await safe_schema_execute(cur, "CREATE INDEX harmonic_user_playlist_lookup_idx ON harmonic_user_playlists (user_id, playlist_name)")
+                await safe_schema_execute(cur, "DROP INDEX harmonic_queue_track_uid_idx ON harmonic_queue")
+                await safe_schema_execute(cur, "DROP INDEX harmonic_queue_backup_track_uid_idx ON harmonic_queue_backup")
                 await safe_schema_execute(cur, "ALTER TABLE harmonic_playback_state ADD COLUMN bot_name VARCHAR(50) DEFAULT 'harmonic'")
                 await safe_schema_execute(cur, "ALTER TABLE harmonic_active_playlists ADD COLUMN bot_name VARCHAR(50) DEFAULT 'harmonic'")
                 await safe_schema_execute(cur, "ALTER TABLE harmonic_bot_home_channels ADD COLUMN bot_name VARCHAR(50) DEFAULT 'harmonic'")
@@ -2066,6 +2070,8 @@ async def init_db():
                 await dedupe_queue_table_by_track_key(cur, "harmonic_queue_backup", bot_name="harmonic")
                 await safe_schema_execute(cur, "CREATE UNIQUE INDEX harmonic_queue_track_uid_unique_idx ON harmonic_queue (guild_id, bot_name, track_uid)")
                 await safe_schema_execute(cur, "CREATE UNIQUE INDEX harmonic_queue_backup_track_uid_unique_idx ON harmonic_queue_backup (guild_id, bot_name, track_uid)")
+                await safe_schema_execute(cur, "CREATE INDEX harmonic_active_playlists_lookup_idx ON harmonic_active_playlists (guild_id, bot_name)")
+                await safe_schema_execute(cur, "CREATE INDEX harmonic_error_events_guild_time_idx ON harmonic_error_events (guild_id, created_at)")
                 playlist_db_initialized = True
                 logger.info("Database tables verified/created for HARMONIC.")
 
@@ -3825,6 +3831,13 @@ async def delete_live_queue_copies(cur, guild_id, video_url, title, track_uid=No
     target_identity = _track_instance_identity(track_uid, video_url, title)
     if not target_identity:
         return 0
+    normalized_uid = _normalize_track_uid(track_uid)
+    if normalized_uid:
+        await cur.execute(
+            "DELETE FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' AND track_uid = %s",
+            (guild_id, normalized_uid),
+        )
+        return max(0, int(getattr(cur, "rowcount", 0) or 0))
     await cur.execute(
         "SELECT id, video_url, title, track_uid FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic'",
         (guild_id,),
@@ -8371,6 +8384,18 @@ async def database_janitor_loop():
                     if deleted_rows > 0:
                         logger.info(f"🧹 Janitor cleared {deleted_rows} old history records.")
                         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "🧹 Database Janitor", f"Successfully cleared **{deleted_rows}** old song history records to optimize database speed.", discord.Color.blurple())
+                    await cur.execute(
+                        "DELETE FROM harmonic_smart_recommendations WHERE created_at < NOW() - INTERVAL 90 DAY"
+                    )
+                    await cur.execute(
+                        "DELETE FROM harmonic_error_events WHERE created_at < NOW() - INTERVAL 30 DAY"
+                    )
+                    await cur.execute(
+                        "DELETE FROM harmonic_track_intelligence WHERE last_played < NOW() - INTERVAL 365 DAY AND play_count <= 1 AND finish_count = 0"
+                    )
+                    await cur.execute(
+                        "DELETE FROM harmonic_user_track_affinity WHERE last_requested < NOW() - INTERVAL 365 DAY AND play_count <= 1"
+                    )
     except Exception as e:
         logger.error(f"Janitor Error: {e}")
 
