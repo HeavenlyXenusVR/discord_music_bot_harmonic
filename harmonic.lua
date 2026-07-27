@@ -2989,7 +2989,16 @@ bot.gateway:on("READY", function(d)
   print("[harmonic] READY -- Harmonic is online.")
   start_background_loops()
   copas.addthread(function()
-    copas.sleep(3)
+    -- Wait for the Lavalink websocket to actually be connected before
+    -- touching the queue -- process_queue deletes each row before resolving
+    -- it, so racing this against Lavalink's own (often slow, cold-start)
+    -- connect meant every "no response from Lavalink" failure permanently
+    -- destroyed that queued track instead of just skipping playback.
+    local waited = 0
+    while not (bot.lavalink and bot.lavalink.session_id) and waited < 60 do
+      copas.sleep(1)
+      waited = waited + 1
+    end
     local ok, err = pcall(restore_persistent_state)
     if not ok then
       print("[harmonic] restore_persistent_state error: " .. tostring(err))
