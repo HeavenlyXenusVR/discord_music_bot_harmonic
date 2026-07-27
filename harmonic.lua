@@ -1157,6 +1157,50 @@ end
 -- Core playback engine (process_queue)
 -- ============================================================================
 
+local channel_kind_cache = {} -- channel_id -> "stage" | "voice"
+local last_stage_topic = {}   -- guild_id -> last topic string sent (dedup)
+
+local function get_channel_kind(channel_id)
+  if not channel_id then return "voice" end
+  local cached = channel_kind_cache[channel_id]
+  if cached then return cached end
+  local ch = bot.rest:get("/channels/" .. tostring(channel_id))
+  local kind = (ch and ch.type == 13) and "stage" or "voice"
+  channel_kind_cache[channel_id] = kind
+  return kind
+end
+
+local function update_stage_topic(guild_id, channel_id, title)
+  if not channel_id then return end
+  local ok, err = pcall(function()
+    local safe_title = tostring(title or "Unknown Track"):gsub("\n", " "):sub(1, 60)
+    local topic = "\xF0\x9F\x8E\xB5 " .. safe_title
+    if last_stage_topic[guild_id] == topic then return end
+    if get_channel_kind(channel_id) == "stage" then
+      local patched = bot.rest:patch("/stage-instances/" .. tostring(channel_id), { topic = topic })
+      if not patched then
+        bot.rest:post("/stage-instances", { channel_id = tostring(channel_id), topic = topic, privacy_level = 2 })
+      end
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = topic })
+    end
+    last_stage_topic[guild_id] = topic
+  end)
+  if not ok then print(("[harmonic] stage/voice topic update failed for %s: %s"):format(tostring(guild_id), tostring(err))) end
+end
+
+local function clear_stage_topic(guild_id, channel_id)
+  last_stage_topic[guild_id] = nil
+  if not channel_id then return end
+  pcall(function()
+    if get_channel_kind(channel_id) == "stage" then
+      bot.rest:delete("/stage-instances/" .. tostring(channel_id))
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = cjson.null })
+    end
+  end)
+end
+
 local function should_auto_disconnect(guild_id, channel_id, stay_in_vc)
   if stay_in_vc then return false end
   local listeners = channel_human_listeners(guild_id, channel_id)
@@ -1204,6 +1248,7 @@ local function process_queue_inner(guild_id, channel_id, start_position)
       return process_queue(guild_id, channel_id)
     end
     if should_auto_disconnect(guild_id, channel_id, stay_in_vc) then
+      clear_stage_topic(guild_id, channel_id)
       disconnect_voice(guild_id)
     end
     return
@@ -1276,6 +1321,8 @@ local function process_queue_inner(guild_id, channel_id, start_position)
     return
   end
 
+  update_stage_topic(guild_id, channel_id, title)
+
   local prev_track = playback_tracking[guild_id]
   playback_tracking[guild_id] = {
     start_time = mono(), offset = start_position, url = url, title = title, duration = duration,
@@ -1334,6 +1381,9 @@ process_queue = function(guild_id, channel_id, start_position)
 end
 
 local function stop_playback(guild_id)
+  local data = playback_tracking[guild_id]
+  local channel_id = (data and data.channel_id) or (guild_states[guild_id] and guild_states[guild_id].voice_channel_id) or get_home_channel_id(guild_id)
+  clear_stage_topic(guild_id, channel_id)
   playback_tracking[guild_id] = nil
   guild_states[guild_id] = nil
   if bot.lavalink.session_id then bot.lavalink:stop(guild_id) end
