@@ -210,6 +210,15 @@ local function is_explicit_lavalink_query(value)
     or value:match("^ytsearch:") ~= nil
 end
 
+-- Ported alongside alucard.lua/lockhart.lua/etc's copy for playlist_sync_tick below.
+local function is_playlist_source(v)
+  v = tostring(v or "")
+  if not v:match("^https?://") then return false end
+  if v:match("[?&]list=") then return true end
+  local lowered = v:lower()
+  return lowered:find("/playlist", 1, true) ~= nil or lowered:find("/sets/", 1, true) ~= nil
+end
+
 -- ============================================================================
 -- Embed / interaction response helpers (bot.lua only wires up a plain
 -- immediate reply; Harmonic needs defer/followup/edit for slash commands
@@ -789,6 +798,241 @@ local function restore_queue_from_backup(guild_id)
   end
   return #rows
 end
+
+-- ===========================================================================
+-- Live playlist sync: auto-add newly appeared tracks / auto-remove tracks
+-- gone from a queued playlist's source. Ported from alucard.py's
+-- playlist_sync_loop -- this was cut fleet-wide during the Lua rewrite
+-- (harmonic_active_playlists existed only as inert per-guild metadata,
+-- written to by nothing but the DELETE calls scattered through /stop,
+-- /clear, sleep-timer-elapsed, and queue-drained; is_playlist_source() was
+-- defined but never called). Simplified vs. the Python original: no
+-- YouTube Data API path (this stack only has Lavalink), so every
+-- re-extraction is treated as equally trustworthy and a removal always
+-- requires 2 consecutive missing cycles rather than distinguishing an
+-- "API-trusted" cycle from a truncating-fallback one.
+-- ===========================================================================
+
+local PLAYLIST_SYNC_INTERVAL = tonumber(env("PLAYLIST_SYNC_INTERVAL", "30")) or 30
+local PLAYLIST_SYNC_MAX_TRACKED = tonumber(env("PLAYLIST_SYNC_MAX_TRACKED", "500")) or 500
+local PLAYLIST_QUEUE_MIN_TRACKS = tonumber(env("PLAYLIST_QUEUE_MIN_TRACKS", "20")) or 20
+local playlist_missing_streak = {} -- guild_id -> {track_key -> consecutive cycles missing}
+
+local function clear_active_playlist(guild_id)
+  q("DELETE FROM harmonic_active_playlists WHERE guild_id = %s AND bot_name = 'harmonic'", guild_id)
+  q("DELETE FROM harmonic_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'harmonic'", guild_id)
+  playlist_missing_streak[guild_id] = nil
+end
+
+-- track_key() itself caps at 64 chars (matches harmonic_track_intelligence's
+-- url_key VARCHAR(64)), but harmonic_active_playlist_tracks.track_key is a
+-- pre-existing CHAR(40) column -- overflowing it fails the INSERT, and
+-- since that happened on every row of every playlist sync, it also tripped
+-- the pg.lua reconnect-storm bug fixed above (same failure, same query, in
+-- a loop). CHAR (not VARCHAR) also blank-pads on read, so values coming
+-- back out of this column need trimming before comparing them against a
+-- freshly computed key.
+local function playlist_track_key(url, title)
+  local k = track_key(url, title)
+  if #k > 40 then k = k:sub(1, 40) end
+  return k
+end
+
+-- Called right after a /play (or equivalent) call resolves to a real
+-- Lavalink loadType=playlist response -- registers it so playlist_sync_tick
+-- starts watching it for adds/removals.
+local function set_active_playlist(guild_id, playlist_url, entries, requester_id, channel_id)
+  if not playlist_url or not entries or #entries == 0 then return end
+  q([[INSERT INTO harmonic_active_playlists (guild_id, bot_name, playlist_url, known_track_count, requester_id, channel_id)
+      VALUES (%s, 'harmonic', %s, %s, %s, %s)
+      ON CONFLICT (guild_id, bot_name) DO UPDATE SET playlist_url = EXCLUDED.playlist_url,
+        known_track_count = EXCLUDED.known_track_count, requester_id = EXCLUDED.requester_id, channel_id = EXCLUDED.channel_id]],
+    guild_id, playlist_url, math.min(#entries, PLAYLIST_SYNC_MAX_TRACKED), requester_id, channel_id)
+  q("DELETE FROM harmonic_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'harmonic'", guild_id)
+  for idx, t in ipairs(entries) do
+    if idx > PLAYLIST_SYNC_MAX_TRACKED then break end
+    q([[INSERT INTO harmonic_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+        VALUES (%s, 'harmonic', %s, %s, %s, %s, %s, %s, %s)]],
+      guild_id, playlist_url, idx - 1, playlist_track_key(t.uri, t.title), new_track_uid(), t.uri, t.title, requester_id)
+  end
+  playlist_missing_streak[guild_id] = nil
+end
+
+-- One sync cycle across every guild with a registered active playlist:
+-- re-extracts each playlist via Lavalink, multiset-diffs it against the
+-- last-known snapshot (harmonic_active_playlist_tracks), enqueues additions,
+-- and removes tracks that have been missing for 2 consecutive cycles
+-- (from both the live queue and its backup mirror) -- plus a loop-mode
+-- duplicate trim and a queue-health refill, matching the Python original.
+local function playlist_sync_tick()
+  local playlists = q("SELECT guild_id, playlist_url, known_track_count, requester_id, channel_id FROM harmonic_active_playlists WHERE bot_name = 'harmonic'") or {}
+  for _, prow in ipairs(playlists) do
+    local gid = prow.guild_id
+    local ok, err = pcall(function()
+      local result, lerr = bot.lavalink:load_tracks(prow.playlist_url)
+      local entries, _pname, uerr = unwrap_load_result(result)
+      if uerr or #entries == 0 then
+        log_warn("[%s] playlist sync: re-extract failed: %s", gid, tostring(uerr or lerr))
+        return
+      end
+      if #entries > PLAYLIST_SYNC_MAX_TRACKED then
+        local trimmed = {}
+        for i = 1, PLAYLIST_SYNC_MAX_TRACKED do trimmed[i] = entries[i] end
+        entries = trimmed
+      end
+
+      local current_rows = {}
+      local current_counts = {}
+      for _, t in ipairs(entries) do
+        local k = playlist_track_key(t.uri, t.title)
+        current_rows[#current_rows + 1] = { url = t.uri, title = t.title, key = k }
+        current_counts[k] = (current_counts[k] or 0) + 1
+      end
+
+      local previous_rows = q("SELECT track_key, track_uid, video_url, title, requester_id FROM harmonic_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY position_idx ASC", gid) or {}
+      local previous_by_key = {}
+      local remaining_previous = {}
+      for _, p in ipairs(previous_rows) do
+        local k = trim(p.track_key or "")
+        previous_by_key[k] = previous_by_key[k] or {}
+        table.insert(previous_by_key[k], p)
+        remaining_previous[k] = (remaining_previous[k] or 0) + 1
+      end
+
+      local added_rows = {}
+      for _, r in ipairs(current_rows) do
+        if remaining_previous[r.key] and remaining_previous[r.key] > 0 then
+          remaining_previous[r.key] = remaining_previous[r.key] - 1
+        else
+          added_rows[#added_rows + 1] = r
+        end
+      end
+
+      local removed_counts = {}
+      local carry_forward = {}
+      local streaks = playlist_missing_streak[gid] or {}
+      for k, missing_n in pairs(remaining_previous) do
+        if missing_n > 0 then
+          local streak = (streaks[k] or 0) + 1
+          streaks[k] = streak
+          if streak >= 2 then
+            removed_counts[k] = missing_n
+          else
+            for i = 1, missing_n do
+              local p = previous_by_key[k] and previous_by_key[k][i]
+              if p then carry_forward[#carry_forward + 1] = p end
+            end
+          end
+        end
+      end
+      for k in pairs(current_counts) do streaks[k] = nil end
+      playlist_missing_streak[gid] = next(streaks) and streaks or nil
+
+      local purged_live, purged_backup = 0, 0
+      if next(removed_counts) ~= nil then
+        local budget = {}
+        for k, c in pairs(removed_counts) do budget[k] = c end
+        local live_rows = q("SELECT id, video_url, title FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY id ASC", gid) or {}
+        for _, lr in ipairs(live_rows) do
+          local k = playlist_track_key(lr.video_url, lr.title)
+          if budget[k] and budget[k] > 0 then
+            budget[k] = budget[k] - 1
+            q("DELETE FROM harmonic_queue WHERE id = %s AND guild_id = %s AND bot_name = 'harmonic'", lr.id, gid)
+            purged_live = purged_live + 1
+          end
+        end
+        budget = {}
+        for k, c in pairs(removed_counts) do budget[k] = c end
+        local backup_rows = q("SELECT id, video_url, title FROM harmonic_queue_backup WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY id ASC", gid) or {}
+        for _, br in ipairs(backup_rows) do
+          local k = playlist_track_key(br.video_url, br.title)
+          if budget[k] and budget[k] > 0 then
+            budget[k] = budget[k] - 1
+            q("DELETE FROM harmonic_queue_backup WHERE id = %s AND guild_id = %s AND bot_name = 'harmonic'", br.id, gid)
+            purged_backup = purged_backup + 1
+          end
+        end
+      end
+
+      if #added_rows > 0 then
+        for _, r in ipairs(added_rows) do enqueue_track(gid, r.url, r.title, prow.requester_id) end
+        snapshot_queue_backup(gid)
+        if #added_rows > 1 then shuffle_queue_rows(gid, true) end
+      end
+
+      -- Trim loop-mode duplicate live-queue copies down to at most 1 per track_key still in the playlist.
+      local trim_count = 0
+      local current_keys = {}
+      for _, r in ipairs(current_rows) do current_keys[r.key] = true end
+      local all_rows = q("SELECT id, video_url, title FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' ORDER BY id ASC", gid) or {}
+      local seen = {}
+      for _, qr in ipairs(all_rows) do
+        local k = playlist_track_key(qr.video_url, qr.title)
+        if current_keys[k] then
+          if seen[k] then
+            q("DELETE FROM harmonic_queue WHERE id = %s AND guild_id = %s AND bot_name = 'harmonic'", qr.id, gid)
+            trim_count = trim_count + 1
+          else
+            seen[k] = true
+          end
+        end
+      end
+
+      -- Queue-health refill: independent of the diff above, top the live queue back up
+      -- if it's thinner than expected relative to the tracked playlist (drained by
+      -- playback/a bug/a restart without the source playlist itself changing).
+      local refilled = 0
+      local queued_rows = q("SELECT video_url, title FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic'", gid) or {}
+      local queued_keys = {}
+      local queued_n = 0
+      for _, qr in ipairs(queued_rows) do
+        local k = playlist_track_key(qr.video_url, qr.title)
+        if not queued_keys[k] then queued_keys[k] = true; queued_n = queued_n + 1 end
+      end
+      local target = math.min(#current_rows, PLAYLIST_QUEUE_MIN_TRACKS)
+      if queued_n < target then
+        local refill_rows = {}
+        for _, r in ipairs(current_rows) do
+          if queued_n + #refill_rows >= target then break end
+          if not queued_keys[r.key] then refill_rows[#refill_rows + 1] = r end
+        end
+        for _, r in ipairs(refill_rows) do enqueue_track(gid, r.url, r.title, prow.requester_id) end
+        if #refill_rows > 0 then
+          refilled = #refill_rows
+          snapshot_queue_backup(gid)
+          shuffle_queue_rows(gid, true)
+        end
+      end
+
+      if #added_rows > 0 or purged_live > 0 or purged_backup > 0 or trim_count > 0 or refilled > 0 then
+        log_info("[%s] playlist sync: +%d -%d(live) -%d(backup) trimmed=%d refilled=%d", gid, #added_rows, purged_live, purged_backup, trim_count, refilled)
+      end
+
+      -- Persist this cycle's confirmed tracks plus anything still in its missing-streak
+      -- grace window as the baseline the next cycle diffs against.
+      q("DELETE FROM harmonic_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'harmonic'", gid)
+      local idx = 0
+      for _, r in ipairs(current_rows) do
+        q([[INSERT INTO harmonic_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+            VALUES (%s, 'harmonic', %s, %s, %s, %s, %s, %s, %s)]],
+          gid, prow.playlist_url, idx, r.key, new_track_uid(), r.url, r.title, prow.requester_id)
+        idx = idx + 1
+      end
+      for _, p in ipairs(carry_forward) do
+        q([[INSERT INTO harmonic_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+            VALUES (%s, 'harmonic', %s, %s, %s, %s, %s, %s, %s)]],
+          gid, prow.playlist_url, idx, trim(p.track_key or ""), trim(p.track_uid or "") ~= "" and trim(p.track_uid) or new_track_uid(), p.video_url, p.title, p.requester_id)
+        idx = idx + 1
+      end
+      q("UPDATE harmonic_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'harmonic'", idx, gid)
+    end)
+    if not ok then
+      log_warn("[%s] playlist sync tick error: %s", gid, tostring(err))
+      report_error(gid, "runtime", "playlist sync error", tostring(err))
+    end
+  end
+end
+
 
 -- loop_mode == 'queue': finished track goes to the back of the line again.
 local function requeue_finished_track(guild_id, video_url, title, requester_id, track_uid)
@@ -1756,6 +2000,9 @@ bot:command(PREFIX .. "play", {
     enqueue_track(interaction.guild_id, t.uri, t.title, requester_id, new_track_uid())
   end
   if #entries > 1 then shuffle_queue_rows(interaction.guild_id, true) end
+  if playlist and is_playlist_source(search) then
+    set_active_playlist(interaction.guild_id, search, entries, requester_id, channel_id)
+  end
 
   local was_idle = not player_is_active(interaction.guild_id)
   if was_idle then
@@ -1805,7 +2052,7 @@ bot:command(PREFIX .. "stop", {
 }, function(self, interaction)
   if not is_dj(interaction) then return end
   stop_playback(interaction.guild_id)
-  q("DELETE FROM harmonic_active_playlists WHERE guild_id = %s AND bot_name = 'harmonic'", interaction.guild_id)
+  clear_active_playlist(interaction.guild_id)
   reply(interaction, embed({ title = "⏹️ Stopped", description = "Music stopped and cleared.", color = COLOR.red }), true)
 end)
 
@@ -1827,7 +2074,7 @@ bot:command(PREFIX .. "sleep", {
     if sleep_timers[guild_id] ~= my_token then return end
     sleep_timers[guild_id] = nil
     stop_playback(guild_id)
-    q("DELETE FROM harmonic_active_playlists WHERE guild_id = %s AND bot_name = 'harmonic'", guild_id)
+    clear_active_playlist(guild_id)
     disconnect_voice(guild_id)
     send_feedback(guild_id, embed({ title = "😴 Sleep Timer", description = "Playback stopped — sleep timer elapsed.", color = COLOR.dark_purple }))
   end)
@@ -1865,7 +2112,7 @@ bot:command(PREFIX .. "clear", {
 }, function(self, interaction)
   if not is_dj(interaction) then return end
   stop_playback(interaction.guild_id)
-  q("DELETE FROM harmonic_active_playlists WHERE guild_id = %s AND bot_name = 'harmonic'", interaction.guild_id)
+  clear_active_playlist(interaction.guild_id)
   q("DELETE FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic'", interaction.guild_id)
   q("DELETE FROM harmonic_queue_backup WHERE guild_id = %s AND bot_name = 'harmonic'", interaction.guild_id)
   reply(interaction, embed({ description = "🗑️ Playback stopped and queue cleared.", color = COLOR.red }), true)
@@ -1888,7 +2135,7 @@ bot:command(PREFIX .. "leave", {
 }, function(self, interaction)
   if not is_dj(interaction) then return end
   stop_playback(interaction.guild_id)
-  q("DELETE FROM harmonic_active_playlists WHERE guild_id = %s AND bot_name = 'harmonic'", interaction.guild_id)
+  clear_active_playlist(interaction.guild_id)
   disconnect_voice(interaction.guild_id)
   reply(interaction, embed({ description = "👋 Left the voice channel.", color = COLOR.blurple }), true)
 end)
@@ -2915,40 +3162,44 @@ local function persist_positions()
   end
 end
 
--- Aria direct-order integration: Aria (the fleet supervisor) drops rows into
--- harmonic_swarm_direct_orders for this bot to execute (join/play/skip/stop/
--- pause/resume/volume/shuffle/clear). Polled, claimed, and cleared here.
+-- SwarmPanel's control.lua writes PLAY/RECOVER/LEAVE/SEEK (uppercase, exactly
+-- as sent -- see insert_direct_order call sites) into
+-- harmonic_swarm_direct_orders for this bot to execute. Polled, claimed, and
+-- cleared here. This previously checked lowercase "join"/"play"/"skip"/etc,
+-- none of which ever matched what the panel actually writes, so every PLAY/
+-- RECOVER/LEAVE/SEEK issued from SwarmPanel silently did nothing.
 local function handle_direct_order(order)
   local guild_id = order.guild_id
   local cmd = order.command
   local ok, err = pcall(function()
-    if cmd == "join" and order.vc_id then
+    if cmd == "PLAY" and order.data and order.vc_id then
       ensure_voice_connection(guild_id, order.vc_id)
-    elseif cmd == "leave" then
-      stop_playback(guild_id); disconnect_voice(guild_id)
-    elseif cmd == "play" and order.data and order.vc_id then
       local entries = search_playables(order.data)
       if entries[1] then
         enqueue_track(guild_id, entries[1].uri, entries[1].title, nil, new_track_uid())
         if not player_is_active(guild_id) then process_queue(guild_id, order.vc_id) end
       end
-    elseif cmd == "skip" then
-      if player_is_active(guild_id) then bot.lavalink:stop(guild_id) end
-    elseif cmd == "stop" then
-      stop_playback(guild_id)
-    elseif cmd == "pause" then
-      bot.lavalink:set_paused(guild_id, true); sync_pause_state(guild_id, true)
-    elseif cmd == "resume" then
-      bot.lavalink:set_paused(guild_id, false); sync_pause_state(guild_id, false)
-    elseif cmd == "volume" and order.data then
-      local vol = clamp(tonumber(order.data) or 100, 1, 200)
-      set_guild_setting(guild_id, "volume", vol)
-      if player_is_active(guild_id) then bot.lavalink:set_volume(guild_id, vol) end
-    elseif cmd == "shuffle" then
-      shuffle_queue_rows(guild_id, false); snapshot_queue_backup(guild_id)
-    elseif cmd == "clear" then
-      q("DELETE FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic'", guild_id)
-      q("DELETE FROM harmonic_queue_backup WHERE guild_id = %s AND bot_name = 'harmonic'", guild_id)
+    elseif cmd == "RECOVER" then
+      local channel_id = order.vc_id and order.vc_id ~= "0" and order.vc_id or get_home_channel_id(guild_id)
+      if channel_id then
+        local row = q("SELECT position_seconds FROM harmonic_playback_state WHERE bot_name = 'harmonic' AND guild_id = %s", guild_id)
+        row = row and row[1]
+        ensure_voice_connection(guild_id, channel_id)
+        if not player_is_active(guild_id) then
+          process_queue(guild_id, channel_id, row and tonumber(row.position_seconds) or 0)
+        end
+      end
+    elseif cmd == "LEAVE" then
+      stop_playback(guild_id); disconnect_voice(guild_id)
+    elseif cmd == "SEEK" and order.data then
+      local target_seconds = math.max(0, tonumber(order.data) or 0)
+      if player_is_active(guild_id) then
+        bot.lavalink:seek(guild_id, math.floor(target_seconds * 1000))
+        if playback_tracking[guild_id] then
+          playback_tracking[guild_id].offset = target_seconds
+          playback_tracking[guild_id].start_time = mono()
+        end
+      end
     end
   end)
   if not ok then
@@ -3052,6 +3303,16 @@ local function start_background_loops()
       if not ok then
         print("[harmonic] swarm override poll error: " .. tostring(err))
         report_error(nil, "runtime", "swarm override poll error", tostring(err))
+      end
+    end
+  end)
+  copas.addthread(function()
+    while true do
+      copas.sleep(PLAYLIST_SYNC_INTERVAL)
+      local ok, err = pcall(playlist_sync_tick)
+      if not ok then
+        print("[harmonic] playlist sync tick error: " .. tostring(err))
+        report_error(nil, "runtime", "playlist sync tick error", tostring(err))
       end
     end
   end)
