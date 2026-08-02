@@ -1220,6 +1220,7 @@ local function ensure_voice_connection(guild_id, channel_id)
   -- validation -- every INSERT here must zero-fill it or this fails outright
   -- on the very first /join, same class of bug as the track-intelligence
   -- counters above).
+  local connected = bot.voice_state[guild_id] and bot.voice_state[guild_id].session_id ~= nil
   q([[
     INSERT INTO harmonic_voice_state (guild_id, bot_name, connected_channel_id, last_channel_id, desired_connected, reconnect_attempts, last_seen_at)
     VALUES (%s, 'harmonic', %s, %s, TRUE, 0, NOW())
@@ -1227,7 +1228,11 @@ local function ensure_voice_connection(guild_id, channel_id)
       connected_channel_id = EXCLUDED.connected_channel_id, last_channel_id = EXCLUDED.last_channel_id,
       desired_connected = TRUE, reconnect_attempts = 0, last_seen_at = NOW(), disconnected_at = NULL
   ]], guild_id, channel_id, channel_id)
-  return true
+  -- Used to unconditionally return true even when the 8s wait above timed
+  -- out with no session_id -- every caller (RECOVER, WebSocketClosedEvent
+  -- recovery, process_queue) proceeded to PATCH the player against a voice
+  -- link that was never actually established, silently producing no audio.
+  return connected
 end
 
 local function disconnect_voice(guild_id)
@@ -3396,7 +3401,14 @@ local function start_background_loops()
           if executed then
             print(("[harmonic] Aria executed %s in guild %s."):format(cmd_name, guild_id))
           end
-          q("DELETE FROM harmonic_swarm_overrides WHERE guild_id = %s AND bot_name = 'harmonic' AND command = %s", guild_id, row.command)
+          -- Only clear the override once it actually ran -- it used to be
+          -- deleted unconditionally, so a command whose guard didn't match yet
+          -- (e.g. PAUSE arriving before playback[guild_id] was populated, a real
+          -- race right after a container restart) was silently dropped forever
+          -- instead of being retried on the next poll.
+          if executed then
+            q("DELETE FROM harmonic_swarm_overrides WHERE guild_id = %s AND bot_name = 'harmonic' AND command = %s", guild_id, row.command)
+          end
         end
       end)
       if not ok then
