@@ -1522,8 +1522,17 @@ end
 
 local process_queue -- forward decl (self-referential via track-end handler)
 
+local resolve_attempts = {}
+local MAX_RESOLVE_ATTEMPTS = 3
+
 local function process_queue_inner(guild_id, channel_id, start_position)
   start_position = start_position or 0
+  if not (bot.lavalink and bot.lavalink.session_id) then
+    -- Lavalink isn't connected right now -- leave the queue untouched
+    -- rather than dequeuing tracks we can't resolve; the watchdog thread
+    -- and the next natural trigger will retry once it's back.
+    return
+  end
   local settings = get_guild_settings(guild_id)
   local volume = settings.volume or 100
   local loop_mode = settings.loop_mode or "queue"
@@ -1582,14 +1591,32 @@ local function process_queue_inner(guild_id, channel_id, start_position)
   end
 
   if not track then
-    print(("[harmonic] [%s] Lavalink search failed for '%s'"):format(tostring(guild_id), tostring(title)))
-    -- Put it back at the tail of recovery instead of losing it silently.
-    enqueue_track(guild_id, url, title, requester_id, track_uid)
-    q("DELETE FROM harmonic_queue WHERE id = (SELECT id FROM harmonic_queue WHERE guild_id = %s AND bot_name = 'harmonic' AND track_uid = %s ORDER BY id DESC LIMIT 1)", guild_id, track_uid)
-    -- avoid a tight failure loop: brief pause then move on to whatever's next
+    -- BUGFIX: this used to enqueue_track() the failed row and then
+    -- immediately DELETE the very row it just inserted (matched by
+    -- track_uid, ORDER BY id DESC LIMIT 1 -- which is always the row just
+    -- inserted) -- a no-op on the live queue that left the track sitting
+    -- ONLY in harmonic_queue_backup (enqueue_track writes both), never
+    -- actually retried. A Lavalink/network blip mid-drain meant every
+    -- remaining queued track quietly vanished from the live queue within
+    -- seconds. Now a failed resolve gets a few bounded retries via
+    -- insert_queue_front before it's given up on.
+    local retry_key = guild_id .. ":" .. tostring(track_uid or url)
+    local attempts = (resolve_attempts[retry_key] or 0) + 1
+    if attempts < MAX_RESOLVE_ATTEMPTS then
+      resolve_attempts[retry_key] = attempts
+      print(("[harmonic] [%s] resolve failed for '%s' (attempt %d/%d) -- requeuing"):format(tostring(guild_id), tostring(title), attempts, MAX_RESOLVE_ATTEMPTS))
+      insert_queue_front(guild_id, url, title, requester_id, track_uid)
+      -- avoid a tight failure loop: brief pause then move on to whatever's next
+      copas.sleep(1.0)
+      return
+    end
+    resolve_attempts[retry_key] = nil
+    print(("[harmonic] [%s] giving up on '%s' after %d failed resolves"):format(tostring(guild_id), tostring(title), attempts))
+    report_error(guild_id, "runtime", "track resolve failed permanently", tostring(title))
     copas.sleep(1.0)
     return process_queue(guild_id, channel_id)
   end
+  resolve_attempts[guild_id .. ":" .. tostring(track_uid or url)] = nil
   url = track.uri or url
   title = track.title or title
   local duration = (track.length_ms or 0) / 1000
@@ -1768,6 +1795,29 @@ bot.lavalink:on("event", function(msg)
 
   if msg.type == "WebSocketClosedEvent" then
     print(("[harmonic] [%s] Voice websocket closed (code=%s)"):format(tostring(guild_id), tostring(msg.code)))
+    -- Lavalink's own link to Discord's voice server died -- distinct from
+    -- our own gateway seeing a disconnect, and previously handled with a
+    -- log line and nothing else, silently ending playback. Only recover if
+    -- we still think we're actively playing (a deliberate stop/leave
+    -- already cleared playback_tracking).
+    local data = playback_tracking[guild_id]
+    local channel_id = (data and data.channel_id) or (guild_states[guild_id] and guild_states[guild_id].voice_channel_id)
+    if data and channel_id then
+      local url, title, requester_id, track_uid = data.url, data.title, data.requester_id, data.track_uid
+      copas.addthread(function()
+        copas.sleep(2)
+        if ensure_voice_connection(guild_id, channel_id) then
+          -- The track that was playing was already dequeued before it
+          -- started, so it isn't sitting in harmonic_queue to be picked
+          -- back up -- put it back at the front (restarts from the
+          -- beginning, not the exact position, but that's a much smaller
+          -- loss than the track vanishing outright).
+          if url then insert_queue_front(guild_id, url, title, requester_id, track_uid) end
+          playback_tracking[guild_id] = nil
+          process_queue(guild_id, channel_id)
+        end
+      end)
+    end
     return
   end
 end)
@@ -3174,11 +3224,16 @@ local function handle_direct_order(order)
   local ok, err = pcall(function()
     if cmd == "PLAY" and order.data and order.vc_id then
       ensure_voice_connection(guild_id, order.vc_id)
-      local entries = search_playables(order.data)
-      if entries[1] then
-        enqueue_track(guild_id, entries[1].uri, entries[1].title, nil, new_track_uid())
-        if not player_is_active(guild_id) then process_queue(guild_id, order.vc_id) end
+      local entries, playlist, terr = search_playables(order.data)
+      if not entries or #entries == 0 then error("could not resolve source: " .. tostring(terr), 0) end
+      for _, t in ipairs(entries) do
+        enqueue_track(guild_id, t.uri, t.title, nil, new_track_uid())
       end
+      if #entries > 1 then shuffle_queue_rows(guild_id, true) end
+      if playlist and is_playlist_source(order.data) then
+        set_active_playlist(guild_id, order.data, entries, nil, order.vc_id)
+      end
+      if not player_is_active(guild_id) then process_queue(guild_id, order.vc_id) end
     elseif cmd == "RECOVER" then
       local channel_id = order.vc_id and order.vc_id ~= "0" and order.vc_id or get_home_channel_id(guild_id)
       if channel_id then
@@ -3230,6 +3285,17 @@ local function restore_persistent_state()
   end
 end
 
+local function recovery_watchdog()
+  local stalled = q("SELECT DISTINCT guild_id FROM harmonic_queue WHERE bot_name = 'harmonic'") or {}
+  for _, row in ipairs(stalled) do
+    local guild_id = tostring(row.guild_id)
+    if not playback_tracking[guild_id] then
+      local channel_id = (guild_states[guild_id] and guild_states[guild_id].voice_channel_id) or get_home_channel_id(guild_id)
+      if channel_id then process_queue(guild_id, channel_id) end
+    end
+  end
+end
+
 local function start_background_loops()
   copas.addthread(function()
     while true do
@@ -3259,6 +3325,16 @@ local function start_background_loops()
         report_error(nil, "runtime", "poll_direct_orders error", tostring(err))
       end
       copas.sleep(DIRECT_ORDER_POLL_INTERVAL)
+    end
+  end)
+  copas.addthread(function()
+    while true do
+      copas.sleep(30)
+      local ok, err = pcall(recovery_watchdog)
+      if not ok then
+        print("[harmonic] recovery_watchdog error: " .. tostring(err))
+        report_error(nil, "runtime", "recovery_watchdog error", tostring(err))
+      end
     end
   end)
   -- SwarmPanel/Aria's PAUSE/RESUME/SKIP/STOP/RESTART buttons write into
